@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Workflow"
+  short_description: "Coordinate optional configured workers"
+  default_prompt: "Use $agent-workflow to coordinate this request with configured workers when delegation fits."

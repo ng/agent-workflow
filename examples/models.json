@@ -1,0 +1,29 @@
+{
+  "models": {
+    "primary": {
+      "provider": "codex",
+      "model": "replace-with-your-codex-model-id",
+      "effort": "medium"
+    }
+  },
+  "roles": {
+    "lookup": "primary",
+    "explore": "primary",
+    "implement": "primary",
+    "plan": "primary",
+    "debug": "primary",
+    "complex": "primary",
+    "review": "primary"
+  },
+  "escalation": {},
+  "worker_packet_bytes": 12288,
+  "dispatch_limits": {
+    "per_stage": 2,
+    "escalations_per_stage": 1,
+    "per_task": 8
+  },
+  "binaries": {
+    "codex": "codex",
+    "ygg": "ygg"
+  }
+}

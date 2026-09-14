@@ -1,0 +1,50 @@
+{
+  "models": {
+    "fast": {
+      "provider": "codex",
+      "model": "replace-with-your-fast-model-id",
+      "effort": "medium"
+    },
+    "deep": {
+      "provider": "codex",
+      "model": "replace-with-your-deep-model-id",
+      "effort": "high"
+    },
+    "independent-review": {
+      "provider": "claude",
+      "model": "replace-with-your-claude-model-id",
+      "effort": "high"
+    }
+  },
+  "roles": {
+    "lookup": "fast",
+    "explore": "fast",
+    "implement": "deep",
+    "plan": "deep",
+    "debug": "deep",
+    "complex": "deep",
+    "review": "independent-review"
+  },
+  "implementation_routes": {
+    "specified": "fast",
+    "architectural": "deep"
+  },
+  "review_routes": {
+    "codex": "independent-review",
+    "claude": "deep"
+  },
+  "escalation": {
+    "implement": "deep"
+  },
+  "worker_packet_bytes": 12288,
+  "dispatch_limits": {
+    "per_stage": 2,
+    "escalations_per_stage": 1,
+    "per_task": 8
+  },
+  "binaries": {
+    "codex": "codex",
+    "claude": "claude",
+    "ygg": "ygg"
+  }
+}
