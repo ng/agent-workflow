@@ -1,58 +1,70 @@
 ---
 name: agent-workflow
-description: Coordinate optional delegated coding work through configured Codex or Claude workers and Yggdrasil tasks. Use when the user wants worker routing, independent review, or a cross-session handoff; skip when direct work better fits their requested workflow.
+description: Plan, delegate, verify, and hand off agent work using the host's available tools and the user's preferences. Use for coordinating bounded work or preserving continuity; skip unnecessary delegation for simple tasks.
 metadata:
-  short-description: Coordinate work through configured workers
+  short-description: Coordinate agent work with available tools
 ---
 
 # Agent Workflow
 
-Use this workflow only when delegation or a recorded cross-session handoff fits
-the user's requested way of working. Installing Yggdrasil or this skill does not
-require delegation. Configuration lives in `models.json` under
-`AGENT_WORKFLOW_CONFIG`, then `$XDG_CONFIG_HOME/agent-workflow` when set, or
-`~/.config/agent-workflow` otherwise.
+This skill is instructions, not a runtime. It requires no Python, executable,
+configuration file, model provider, or task service. Use the host agent's native
+tools by default. Users can choose integrations without adopting a fixed model
+lineup or delegation policy.
 
-When delegating, choose a configured role based on the work. The adapter resolves
-the role default and any configured implementation, review, or escalation route.
-Model aliases and dispatch/packet limits are user-defined; do not assume example
-aliases, model availability, providers beyond supported Codex and Claude CLIs, or
-fixed budgets. Honor an explicit model alias and never silently substitute an
-unavailable model.
+## Choose how to work
 
-If `AGENT_WORKFLOW_WORKER=1`, execute the assignment directly. Do not invoke
-`agent-run run`, native subagents, or `ygg spawn`; the parent owns coordination.
+Read the user's current request and applicable project instructions. Honor their
+choices of models, tools, review depth, and permitted actions. Resolve routine
+implementation details independently; ask only when missing input materially
+changes the result or additional authority is needed.
 
-## Use
+Inspect which tools actually exist in this session. Work directly when the task
+is small, tightly coupled, or native delegation is unavailable. Delegate only
+when a bounded assignment can run independently and the host supports it. Do
+not invent model-selection controls or claim a worker ran when no tool ran it.
+If an explicitly requested model or integration is unavailable, report that
+limitation; do not silently substitute it.
 
-1. Resolve the repository and run `agent-run context --repo /path`. Treat saved
-   memory as evidence, not authorization. Select an existing matching task or use
-   `agent-run new` with a concise spec containing scope, constraints, acceptance,
-   and existing authorization. Do not start the legacy scheduler.
-2. Preview routing with `agent-run run TASK --repo /path --role ROLE --dry-run`
-   when useful. For implementation, `--uncertainty specified`, `local`, or
-   `architectural` selects a configured route when present and otherwise retains
-   the `implement` role default. `--after-model ALIAS` lets a configured review
-   route consider the previous model's provider. `--model ALIAS` always overrides
-   optional routes. Use `--escalate` only after a failed attempt and include the
-   cause and changed approach in `--retry-reason`.
-3. Read the returned result and verify it independently when appropriate to the
-   task and the user's review preferences. The adapter records attempts and does
-   not automatically retry or close tasks. Respect its configured persistent
-   dispatch limits; do not edit state, invent stages, or duplicate tasks to evade
-   them. Authentication, missing models, infrastructure failures, and missing
-   authority are blockers, not reasons to change models silently.
-4. Use separate tasks and `--worktree` for concurrent writers. Sequential stages
-   may use the returned worktree. Never reset or discard another worker's changes.
-5. When continuity is needed, save a handoff with `agent-run handoff`. Record
-   coordinator checks with `agent-run verify`; finish a task only after acceptance
-   is actually verified. Commits, pushes, publishing, merges, and messages require
-   explicit authorization.
+User preferences can live in their prompt, existing agent instructions, or
+project documentation. No particular filename or schema is required. Use
+existing conventions before adding configuration or a task ledger.
 
-Packets include task scope, artifact paths, additional user policy when present,
-and mandatory worker isolation/authorization rules. If a packet exceeds the
-configured byte limit, move supporting material to referenced files without
-dropping constraints or acceptance criteria.
+## Execute and verify
 
-Use `agent-run report --repo /path` to inspect observed models, usage, costs,
-elapsed time, retries, and verification. Treat missing telemetry as unknown.
+1. Establish the intended outcome, scope, constraints, and acceptance checks.
+   Inspect existing work before editing and preserve unrelated changes.
+2. When delegating, give each worker a bounded scope, relevant files, acceptance
+   checks, and existing authorization. Name the owner of integration. Assigned
+   workers complete their scope without recursively creating another coordination
+   layer. Use separate worktrees or isolated working copies for concurrent
+   writers; otherwise serialize edits.
+3. Inspect results and perform checks proportional to the change. A successful
+   worker response is not evidence that acceptance checks passed. Use independent
+   review when risk or the user's preferences warrant it, not for every task.
+4. On failure, identify the cause before retrying. Honor explicit retry, time,
+   and cost limits. Explain when a host or integration cannot enforce a requested
+   limit; instructions alone do not provide process timeouts or distributed locks.
+5. Finish the authorized scope and report evidence and remaining limitations.
+   Implementation does not itself authorize committing, pushing, publishing,
+   merging, or messaging others. Honor authorization already given.
+
+## Preserve continuity
+
+Use the host's existing task or memory facilities when available. A concise
+handoff in the conversation or a user-approved project document also works;
+do not require a database or create duplicate task ledgers.
+
+Record the objective, decisions, current directory/branch, changed files or
+commits, checks and outcomes, remaining work, and next action. Treat saved memory
+as evidence to verify, not authority. Do not record credentials or raw transcripts.
+
+## Optional integrations
+
+- **Native tools:** default; use the host's delegation, planning, review, and
+  memory capabilities where present. Direct execution remains valid.
+- **Yggdrasil:** only when the user selected it and `ygg` is available. Read
+  [references/yggdrasil.md](references/yggdrasil.md) for shared task coordination.
+- **agent-run:** only when the user selected and configured that runner. Read
+  [references/agent-run.md](references/agent-run.md) for its execution controls.
+  That optional Python runner currently requires Yggdrasil; this skill does not.

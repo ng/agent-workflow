@@ -451,7 +451,7 @@ class InstallerTests(unittest.TestCase):
             models.write_text('personal models\n')
             agents.write_text('personal policy\n')
             env = {**os.environ, 'AGENT_WORKFLOW_CONFIG': str(config_dir)}
-            command = [str(checkout / 'install.sh'), '--bin-dir', str(bin_dir),
+            command = [str(checkout / 'install.sh'), '--with-runner', '--bin-dir', str(bin_dir),
                        '--skill-dir', str(skill_dir)]
             for _ in range(2):
                 subprocess.run(command, env=env, check=True, capture_output=True, text=True)
@@ -469,10 +469,35 @@ class InstallerTests(unittest.TestCase):
             command_path = bin_dir / 'agent-run'
             command_path.write_text('keep me\n')
             result = subprocess.run(
-                [str(WORKFLOW_ROOT / 'install.sh'), '--bin-dir', str(bin_dir)],
+                [str(WORKFLOW_ROOT / 'install.sh'), '--with-runner', '--bin-dir', str(bin_dir)],
                 env=os.environ.copy(), capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(command_path.read_text(), 'keep me\n')
+
+    def test_skill_only_install_without_python_runner_or_config(self):
+        with tempfile.TemporaryDirectory(prefix='skill only ') as temp:
+            root = Path(temp)
+            shell_tools = root / 'shell-tools'
+            shell_tools.mkdir()
+            for command in ('bash', 'dirname', 'mkdir', 'ln'):
+                (shell_tools / command).symlink_to(shutil.which(command))
+            env = {**os.environ, 'PATH': str(shell_tools),
+                   'AGENT_WORKFLOW_CONFIG': str(root / 'absent-config')}
+            skill_dir = root / 'skills'
+            bin_dir = root / 'existing-bin'
+            bin_dir.mkdir()
+            runner = bin_dir / 'agent-run'
+            runner.write_text('preserve existing runner')
+            command = [str(WORKFLOW_ROOT / 'install.sh'), '--skill-dir', str(skill_dir),
+                       '--bin-dir', str(bin_dir)]
+            for _ in range(2):
+                result = subprocess.run(command, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(runner.read_text(), 'preserve existing runner')
+            self.assertFalse((root / 'absent-config').exists())
+            self.assertEqual((skill_dir / 'agent-workflow').resolve(),
+                             (WORKFLOW_ROOT / 'skills/agent-workflow').resolve())
+            self.assertNotIn('Setup required', result.stdout)
 
 
 def tearDownModule():

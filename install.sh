@@ -4,17 +4,23 @@ set -eu
 workflow_source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 workflow_bin_dir=${HOME:?HOME must be set}/.local/bin
 workflow_skill_dirs=()
+workflow_with_runner=false
 
 usage() {
   printf '%s\n' \
-    'Usage: install.sh [--bin-dir DIR] [--skill-dir DIR]...' \
+    'Usage: install.sh [--skill-dir DIR]... [--with-runner [--bin-dir DIR]]' \
     '' \
-    'Installs an agent-run symlink and optional agent-workflow skill symlinks.' \
+    'Installs only the skill by default (~/.codex/skills).' \
+    '--with-runner also installs the optional Python agent-run CLI.' \
     'Personal configuration and policy files are never created or changed.'
 }
 
 while (($#)); do
   case $1 in
+    --with-runner)
+      workflow_with_runner=true
+      shift
+      ;;
     --bin-dir)
       (($# >= 2)) || { printf '%s\n' 'install.sh: --bin-dir requires a value' >&2; exit 2; }
       workflow_bin_dir=$2
@@ -48,12 +54,21 @@ install_link() {
   ln -sfn -- "$workflow_source" "$workflow_destination"
 }
 
-install_link "$workflow_source_dir/agent_run.py" "$workflow_bin_dir/agent-run"
+if ((${#workflow_skill_dirs[@]} == 0)); then
+  workflow_skill_dirs+=("${HOME:?HOME must be set}/.codex/skills")
+fi
+if [[ $workflow_with_runner == true ]]; then
+  install_link "$workflow_source_dir/agent_run.py" "$workflow_bin_dir/agent-run"
+fi
 for workflow_skill_dir in "${workflow_skill_dirs[@]}"; do
   install_link "$workflow_source_dir/skills/agent-workflow" \
     "$workflow_skill_dir/agent-workflow"
 done
 
+printf 'Installed Agent Workflow skill from %s\n' "$workflow_source_dir"
+if [[ $workflow_with_runner != true ]]; then
+  exit 0
+fi
 workflow_config_dir=${AGENT_WORKFLOW_CONFIG:-${XDG_CONFIG_HOME:-${HOME:?HOME must be set}/.config}/agent-workflow}
 printf 'Installed agent-run from %s\n' "$workflow_source_dir"
 printf 'Configuration remains user-managed at %s\n' "$workflow_config_dir"

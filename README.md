@@ -1,145 +1,79 @@
-# Agent Workflow — extraction in progress
+# Agent Workflow
 
-Agent Workflow provides configurable model routing, worker execution, and
-handoffs through the `agent-run` CLI.
+A standalone skill for planning, delegation, verification, and handoffs using
+the tools your agent already provides.
 
-**The backend extraction is unfinished: the current runner still requires
-Yggdrasil.** A local backend with an optional Yggdrasil integration is planned;
-standalone operation without `ygg` is not implemented yet.
+**The skill needs no Python, executable, configuration file, or Yggdrasil.**
+Native agent tools are the default. If delegation isn't available or useful,
+the agent works directly.
 
-The current implementation is opt-in and routes Codex or Claude CLI workers
-through Yggdrasil. Cloning this repository does not activate the workflow.
-You may independently choose the `agent-run` CLI, the `agent-workflow` skill, and
-interactive shell wrappers. None requires adopting this repository's
-`AGENTS.md` or copying the example policy.
+## Install the skill
 
-Source stays in this checkout. User-selected models, optional additional policy,
-and runtime state stay in a user-owned configuration directory.
+Copy the [`skills/agent-workflow`](skills/agent-workflow) directory into your
+agent's skills directory. That's the entire installation; the other repository
+files are optional tooling or development files.
 
-## Configure models
-
-The configuration directory is selected in this order:
-
-1. `AGENT_WORKFLOW_CONFIG`
-2. `$XDG_CONFIG_HOME/agent-workflow`
-3. `~/.config/agent-workflow`
-
-Copy the minimal single-provider example, then replace its placeholder `model`
-with an identifier available to your installed Codex CLI:
+For a local checkout, you can instead create a symlink:
 
 ```sh
-config_dir=${AGENT_WORKFLOW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-workflow}
-mkdir -p "$config_dir"
-test -e "$config_dir/models.json" || cp examples/models.json "$config_dir/models.json"
+mkdir -p "$HOME/.codex/skills"
+ln -s "$PWD/skills/agent-workflow" "$HOME/.codex/skills/agent-workflow"
 ```
 
-Aliases such as `primary`, `fast`, or `deep` are arbitrary user-defined names;
-they are not model identifiers and do not imply those models are available.
-Actual execution requires `models.json`. Top-level `agent-run --help` works
-without configuration.
+Use your host's skill directory (for example `~/.claude/skills`) as appropriate.
+Keep the checkout in place if you use a symlink. Preserve an existing installation
+before replacing it.
 
-The schema is:
-
-- `models`: alias to `{ "provider": "codex" | "claude", "model": "CLI model id",
-  "effort": "CLI effort" }`. Only the built-in Codex and Claude adapters are
-  supported.
-- `roles`: defaults for every supported role: `lookup`, `explore`, `implement`,
-  `plan`, `debug`, `complex`, and `review`. Each value is a configured alias.
-- `implementation_routes` (optional): any subset of `specified`, `local`, and
-  `architectural` mapped to aliases. Missing entries use `roles.implement`.
-- `review_routes` (optional): `codex` and/or `claude` mapped to aliases. With
-  `--after-model`, the previous alias's provider selects a configured route;
-  otherwise `roles.review` remains selected.
-- `escalation`: role-to-alias mappings. Use `{}` when no escalation route is
-  desired.
-- `worker_packet_bytes` and `dispatch_limits`: positive integer safeguards.
-  Limits are user-configured and persist per task UUID.
-- `binaries`: commands for `ygg` and the providers referenced by `models`.
-  A single-provider setup does not need the other provider installed or configured.
-
-`--model ALIAS` takes precedence over uncertainty, prior-provider review, and
-escalation routing. Unknown aliases/providers and malformed route maps fail
-explicitly; the adapter never falls back silently. See
-[`examples/models-routing.json`](examples/models-routing.json) for optional
-multi-alias and cross-provider routing. Its model identifiers are placeholders.
-
-Existing configurations migrate without renaming aliases. To preserve the
-previous sample behavior, add exactly:
-
-```json
-"implementation_routes": {
-  "specified": "luna",
-  "local": "sol",
-  "architectural": "astra"
-},
-"review_routes": {
-  "codex": "opus-4.6",
-  "claude": "astra"
-}
-```
-
-Those aliases must already exist in `models`. Without these additions,
-implementation uncertainty and `--after-model` use their role defaults. Existing
-`roles`, `escalation`, packet limits, dispatch limits, and binaries remain valid.
-
-## Optional additional policy
-
-`<config-dir>/AGENTS.md` is optional user-owned guidance. If absent, no additional
-policy is loaded. The adapter still independently injects mandatory worker
-isolation, task ownership, change-preservation, and authorization boundaries.
-If useful, start from [`examples/AGENTS.md`](examples/AGENTS.md); it does not
-mandate delegation or review for every coding task.
-
-State defaults to `<config-dir>/state`; set `AGENT_WORKFLOW_STATE` to place it
-elsewhere. Runtime state stays outside this source checkout by default.
-
-## Install only what you want
-
-Install the CLI symlink without changing Yggdrasil, personal configuration, or
-global agent policy:
+An optional Bash helper installs only the skill by default:
 
 ```sh
-./install.sh
+./install.sh --skill-dir "$HOME/.codex/skills"
+./install.sh --skill-dir "$HOME/.claude/skills"
 ```
 
-Optionally install the skill in one or more agent skill directories:
+With no arguments, the helper uses `~/.codex/skills`. It does not launch Python,
+install `agent-run`, or create model configuration. Manual copying doesn't
+require Bash either.
+
+## Use and customize
+
+Invoke `$agent-workflow` in a host that supports named skills, or ask the agent
+to follow its instructions. Use existing agent instructions or your prompt to
+choose how you work, for example:
+
+> Work directly on small changes. Delegate independent investigations when
+> native workers are available. Use independent review for risky changes and
+> keep a short handoff in the conversation.
+
+No model names, providers, review pipeline, or configuration schema are imposed.
+The skill guides behavior; hard process limits and distributed locking require
+support from the host or an optional integration.
+
+## Optional integrations
+
+| Choice | Adds | Requirements |
+| --- | --- | --- |
+| Native agent tools | Existing host delegation and continuity | No extra runtime; direct work also supported |
+| Yggdrasil | Shared tasks, locks, and coordination | Installed/configured `ygg` service |
+| `agent-run` | Model routing, process controls, retry budgets, and run records | Python 3.10+, Git, provider CLI(s), and currently Yggdrasil |
+
+These integrations are independent choices, not prerequisites for the skill.
+The bundled runner still requires Yggdrasil; a local runner backend has not been
+implemented. This does not limit standalone use of the skill.
+
+To opt into the existing runner as well as the skill:
 
 ```sh
-./install.sh \
-  --skill-dir "$HOME/.codex/skills" \
-  --skill-dir "$HOME/.claude/skills"
+./install.sh --with-runner
 ```
 
-`--bin-dir DIR` changes the CLI destination. Reruns refresh only managed
-symlinks, including when paths contain spaces; regular files are never replaced.
-The installer never creates or overwrites `models.json` or `AGENTS.md`.
+See [runner setup and configuration](docs/agent-run.md). Existing runner
+installations and external personal configuration remain supported.
 
-Separately, source `shell.zsh` from interactive zsh only if you want
-`codex` and `claude` launch wrappers. `command codex` and `command claude` bypass
-them. The wrappers add optional policy and Yggdrasil context to interactive
-sessions; provider management/help commands bypass injected session policy.
+## Development
 
-## Use
-
-```sh
-agent-run context --repo /path/to/repo
-agent-run new --repo /path/to/repo --title 'Fix pagination' --body-file /path/spec.md
-agent-run run repo-42 --repo /path/to/repo --role implement
-agent-run verify RUN_ID --repo /path/to/repo --status passed --evidence-file /path/checks.md
-agent-run report --repo /path/to/repo
-agent-run handoff repo-42 --repo /path/to/repo --file /path/handoff.md
-agent-run remember --repo /path/to/repo --text 'Verified fact' --source 'path/task'
-agent-run finish repo-42 --repo /path/to/repo --reason 'Acceptance verified'
-agent-run doctor --repo /path/to/repo
-```
-
-The adapter retains task claims, dependency checks, worktree isolation, local and
-Yggdrasil locks, worker recursion restrictions, timeouts, persistent retry
-budgets, telemetry, verification records, reports, and shared project memory. It
-does not launch the legacy scheduler. Worker success does not close tasks; the
-coordinator verifies and finishes them separately.
-
-Run the local checks with:
+Python is used for the optional runner and its tests, not to install or use the
+skill. Run its regression checks with:
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
