@@ -27,8 +27,11 @@ If an explicitly requested model or integration is unavailable, report that
 limitation; do not silently substitute it.
 
 User preferences can live in their prompt, existing agent instructions, or
-project documentation. No particular filename or schema is required. Use
-existing conventions before adding configuration or a task ledger.
+project documentation. No configuration is required. Unless the user disables
+file-based routing, read [references/routing.md](references/routing.md) to check
+the documented configuration location and resolve any existing model mappings.
+A user-owned file there is an opt-in; the bundled template is not. Use existing
+conventions before adding configuration or a task ledger.
 
 ## Execute and verify
 
@@ -63,6 +66,9 @@ as evidence to verify, not authority. Do not record credentials or raw transcrip
 
 - **Native tools:** default; use the host's delegation, planning, review, and
   memory capabilities where present. Direct execution remains valid.
+- **Portable routing:** optional user-owned model and role preferences for native
+  hosts. Read [references/routing.md](references/routing.md); start, if useful,
+  from [references/routing.example.json](references/routing.example.json).
 - **Yggdrasil:** only when the user selected it and `ygg` is available. Read
   [references/yggdrasil.md](references/yggdrasil.md) for shared task coordination.
 - **agent-run:** only when the user selected and configured that runner. Read

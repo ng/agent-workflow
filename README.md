@@ -20,9 +20,11 @@ mkdir -p "$HOME/.codex/skills"
 ln -s "$PWD/skills/agent-workflow" "$HOME/.codex/skills/agent-workflow"
 ```
 
-Use your host's skill directory (for example `~/.claude/skills`) as appropriate.
-Keep the checkout in place if you use a symlink. Preserve an existing installation
-before replacing it.
+Use your host's skill directory as appropriate. For Claude Code, copy or symlink
+the complete directory to `~/.claude/skills/agent-workflow`, then invoke
+`/agent-workflow`. Keep the checkout in place if you use a symlink. Preserve an
+existing installation before replacing it. Claude Code's official documentation
+covers [skill directories, references, symlinks, and invocation](https://code.claude.com/docs/en/skills).
 
 An optional Bash helper installs only the skill by default:
 
@@ -45,9 +47,28 @@ choose how you work, for example:
 > native workers are available. Use independent review for risky changes and
 > keep a short handoff in the conversation.
 
-No model names, providers, review pipeline, or configuration schema are imposed.
-The skill guides behavior; hard process limits and distributed locking require
-support from the host or an optional integration.
+No model names, providers, or review pipeline are imposed. The skill guides
+behavior; hard process limits and distributed locking require support from the
+host or an optional integration.
+
+Model routing is also optional. The bundled
+[`routing.example.json`](skills/agent-workflow/references/routing.example.json)
+is a minimal single-model template, never active configuration. If you choose to
+use it, copy it without overwriting an existing file to a user-owned
+`models.json`. The skill reads an explicitly named file first; otherwise it uses
+`models.json` under `AGENT_WORKFLOW_CONFIG` (a directory), then
+`$XDG_CONFIG_HOME/agent-workflow`, then `~/.config/agent-workflow`. Missing
+ordinary optional configuration leaves current host defaults in place. Explicit
+missing, unreadable, or malformed configuration is reported rather than skipped.
+See the [portable routing procedure](skills/agent-workflow/references/routing.md).
+An existing user-owned file at that location opts into routing; the skill checks
+it unless you disable file-based routing. Installation never creates or replaces it.
+
+This JSON is instruction data read by the skill, not a Claude Code settings
+schema or autoloaded native configuration. Claude's native model and effort
+controls are used only when actually exposed; cross-provider selection requires
+an explicitly available external integration. See Claude Code's official
+[subagent documentation](https://code.claude.com/docs/en/sub-agents).
 
 ## Optional integrations
 
