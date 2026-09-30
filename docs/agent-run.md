@@ -129,6 +129,7 @@ agent-run new --repo /path/to/repo --title 'Fix pagination' --body-file /path/sp
 agent-run run repo-42 --repo /path/to/repo --role implement
 agent-run verify RUN_ID --repo /path/to/repo --status passed --evidence-file /path/checks.md
 agent-run report --repo /path/to/repo
+agent-run log [--repo /path/to/repo] [--limit 20] [--json]
 agent-run handoff repo-42 --repo /path/to/repo --file /path/handoff.md
 agent-run remember --repo /path/to/repo --text 'Verified fact' --source 'path/task'
 agent-run finish repo-42 --repo /path/to/repo --reason 'Acceptance verified'
@@ -140,6 +141,14 @@ Yggdrasil locks, worker recursion restrictions, timeouts, persistent retry
 budgets, telemetry, verification records, reports, and shared project memory. It
 does not launch the legacy scheduler. Worker success does not close tasks; the
 coordinator verifies and finishes them separately.
+
+`agent-run run` prints `agent-run: <role> → <alias> (<model>) · run <id>` to
+stderr when it dispatches, and a warning if the provider reports a different
+model than the one requested (the context-window suffix such as `[1m]` is
+ignored, and bare family aliases such as `sonnet` match any model in that
+family). `agent-run log` shows recent runs across all projects, newest first,
+with requested and served models, state, tokens, cost, and run ID. Codex does
+not currently report the served model, so those rows show `-`.
 
 Run the local checks with:
 

@@ -545,6 +545,33 @@ def collect_telemetry(provider, path):
         return result
 
 
+def _model_key(name):
+    return re.sub(r'\[[^\]]*\]$', '', name.strip().lower())
+
+
+def model_matches(requested, observed):
+    """True unless the provider reported a different model than the one requested.
+
+    Unreported models match; a bare family name such as `sonnet` matches any
+    model containing it, because such aliases intentionally float.
+    """
+    if not requested or not observed:
+        return True
+    requested, observed = _model_key(requested), _model_key(observed)
+    if requested == observed:
+        return True
+    return not re.search(r'\d', requested) and requested in observed
+
+
+def route_line(selected, role, run_id=None, escalation=False):
+    line = f'agent-run: {role} → {selected["alias"]} ({selected["model"]})'
+    if escalation:
+        line += ' [escalation]'
+    if run_id:
+        line += f' · run {run_id}'
+    return line
+
+
 def run_worker(args, repo):
     if os.environ.get('AGENT_WORKFLOW_WORKER') == '1' and not getattr(args, 'dry_run', False):
         raise RuntimeError('Worker recursion is disabled; return a handoff to the coordinator.')
@@ -633,6 +660,8 @@ def run_worker(args, repo):
             leased = True
             meta['state'] = 'running'
             write_json(artifacts / 'run.json', meta)
+            print(route_line(selected, args.role, run_id, budget.get('escalation')),
+                  file=sys.stderr, flush=True)
             with (artifacts / 'events.jsonl').open('w') as stdout, (artifacts / 'stderr.log').open('w') as stderr:
                 proc = sp.Popen(command, cwd=cwd, env=env, stdin=sp.PIPE,
                                 stdout=stdout, stderr=stderr, text=True, start_new_session=True)
@@ -676,14 +705,22 @@ def run_worker(args, repo):
                         observed_model=telemetry['observed_model'],
                         observed_models=telemetry['observed_models'],
                         usage=telemetry['usage'],
-                        provider_cost_usd=telemetry['cost_usd'])
+                        provider_cost_usd=telemetry['cost_usd'],
+                        model_mismatch=not model_matches(selected['model'],
+                                                         telemetry['observed_model']))
             write_json(artifacts / 'run.json', meta)
+            if meta['model_mismatch']:
+                print(f'agent-run: warning: requested {selected["model"]} but '
+                      f'{telemetry["observed_model"]} answered · run {run_id}',
+                      file=sys.stderr, flush=True)
+            served = telemetry['observed_model'] or 'model not reported'
             cleanup_errors = []
             if claimed:
                 try:
                     ygg(['run', 'finalize', args.task, '--state', state, '--agent', agent], repo)
                     summary = output.read_text()[:16000] if output.exists() else failure
-                    append_notes(args.task, repo, f'Worker {run_id} {state}. Result: {output}\n{summary}')
+                    append_notes(args.task, repo, f'Worker {run_id} {state} '
+                                 f'({selected["alias"]}: {served}). Result: {output}\n{summary}')
                 except Exception as error:
                     cleanup_errors.append(str(error))
             if leased:
@@ -800,6 +837,65 @@ def report(repo):
     return {'repo': str(repo), 'rows': rows, 'aggregate': aggregate}
 
 
+def run_log(repo=None, limit=20):
+    """Recent runs across every project (or one repository), newest first."""
+    rows = []
+    for path in (STATE / 'projects').glob('*/runs/*/run.json'):
+        try:
+            meta = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        saved_repo = meta.get('repo')
+        if repo is not None and (not isinstance(saved_repo, str) or not saved_repo
+                                 or Path(saved_repo).resolve() != Path(repo).resolve()):
+            continue
+        telemetry = meta.get('telemetry') or {}
+        usage = meta.get('usage') if 'usage' in meta else telemetry.get('usage')
+        cost = meta.get('provider_cost_usd') if 'provider_cost_usd' in meta else telemetry.get('cost_usd')
+        observed = meta.get('observed_model', telemetry.get('observed_model'))
+        rows.append({
+            'run_id': meta.get('id'), 'created_at': meta.get('created_at') or '',
+            'repo': saved_repo, 'role': meta.get('role'), 'alias': meta.get('alias'),
+            'requested_model': meta.get('model'), 'observed_model': observed,
+            'model_mismatch': not model_matches(meta.get('model'), observed),
+            'state': meta.get('state'),
+            'total_tokens': (usage or {}).get('total_tokens') if isinstance(usage, dict) else None,
+            'cost_usd': cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+            'artifacts': str(path.parent)})
+    rows.sort(key=lambda row: row['created_at'], reverse=True)
+    return rows[:limit] if limit else rows
+
+
+def format_run_log(rows):
+    if not rows:
+        return 'No agent-run runs recorded.'
+    def when(stamp):
+        try:
+            return dt.datetime.fromisoformat(stamp).astimezone().strftime('%Y-%m-%d %H:%M')
+        except (TypeError, ValueError):
+            return '-'
+    header = ('time', 'repo', 'role', 'alias', 'requested', 'served', 'state', 'tokens', 'cost', 'run')
+    table = [header] + [(
+        when(row['created_at']), Path(row['repo']).name if row['repo'] else '-',
+        row['role'] or '-', row['alias'] or '-', row['requested_model'] or '-',
+        (row['observed_model'] or '-') + (' !' if row['model_mismatch'] else ''),
+        row['state'] or '-',
+        f'{row["total_tokens"]:,}' if isinstance(row['total_tokens'], (int, float)) else '-',
+        f'${row["cost_usd"]:.2f}' if row['cost_usd'] is not None else '-',
+        row['run_id'] or '-') for row in rows]
+    widths = [max(len(str(line[i])) for line in table) for i in range(len(header))]
+    lines = ['  '.join(str(value).ljust(width) for value, width in zip(line, widths)).rstrip()
+             for line in table]
+    lines.insert(1, '  '.join('-' * width for width in widths))
+    if any(row['model_mismatch'] for row in rows):
+        lines.append('\n! a different model answered than the one requested')
+    if any(not row['observed_model'] for row in rows):
+        lines.append('- served model not reported by the provider')
+    return '\n'.join(lines)
+
+
 def launch(provider, argv):
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(
@@ -869,7 +965,16 @@ def main():
             p.add_argument('--file', required=True)
         if name == 'finish':
             p.add_argument('--reason', required=True)
+    p = sub.add_parser('log', help='Recent runs with requested and served models')
+    p.add_argument('--repo', help='Limit to one repository (default: all projects)')
+    p.add_argument('--limit', type=int, default=20, help='Rows to show; 0 for all')
+    p.add_argument('--json', action='store_true')
     args = parser.parse_args()
+    if args.command == 'log':
+        repo = project(args.repo)[0] if args.repo else None
+        rows = run_log(repo, max(args.limit, 0))
+        print(json.dumps(rows, indent=2) if args.json else format_run_log(rows))
+        return
     repo, folder = project(args.repo)
     if args.command == 'context':
         print(context(repo))

@@ -54,3 +54,7 @@ dropping constraints or acceptance criteria.
 
 Use `agent-run report --repo /path` to inspect observed models, usage, costs,
 elapsed time, retries, and verification. Treat missing telemetry as unknown.
+`agent-run run` prints the route (`role → alias (model)`) to stderr at dispatch
+and warns when the provider reports a different model than requested; relay
+that warning to the user. `agent-run log` lists recent runs across projects
+with requested and served models.

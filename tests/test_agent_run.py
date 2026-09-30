@@ -377,7 +377,7 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 w.verify_run(repo, '../escape', 'passed', evidence)
 
-    def exercise_worker(self, exit_code=0, timeout=False):
+    def exercise_worker(self, exit_code=0, timeout=False, served=None):
         with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
             repo = Path(temp)
             task = {'ref': 'test-1', 'task': {'task_id': 'test-id', 'status': 'Open',
@@ -395,6 +395,9 @@ class WorkflowTests(unittest.TestCase):
                     code = 'import time; time.sleep(30)'
                 else:
                     code = f'from pathlib import Path; Path({str(output)!r}).write_text("result"); raise SystemExit({exit_code})'
+                    if served:
+                        event = json.dumps({'type': 'thread.started', 'model': served})
+                        code = f'print({event!r}); ' + code
                 return [os.sys.executable, '-c', code]
             args = types.SimpleNamespace(role='implement', model=None, after_model=None,
                                          escalate=False, dry_run=False, task='test-1',
@@ -404,7 +407,8 @@ class WorkflowTests(unittest.TestCase):
                  patch.object(w, 'worker_command', side_effect=command), \
                  patch.object(w, 'call', return_value=types.SimpleNamespace(returncode=0, stdout=str(repo))), \
                  patch.dict(os.environ, {'AGENT_WORKFLOW_WORKER': ''}), \
-                 contextlib.redirect_stdout(io.StringIO()):
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr:
                 if exit_code or timeout:
                     with self.assertRaises(RuntimeError):
                         w.run_worker(args, repo)
@@ -419,11 +423,66 @@ class WorkflowTests(unittest.TestCase):
             record = json.loads(records[0].read_text())
             self.assertIn('telemetry', record)
             self.assertIn('elapsed_seconds', record)
-            self.assertIsNone(record['telemetry']['provenance']['model'])
+            if not served:
+                self.assertIsNone(record['telemetry']['provenance']['model'])
+            run_id = record['id']
+            self.assertIn(f'agent-run: implement → sol (gpt-5.6-sol) · run {run_id}',
+                          stderr.getvalue())
+            record['stderr'] = stderr.getvalue()
             return record
 
     def test_worker_success_stays_open(self):
-        self.assertEqual(self.exercise_worker()['state'], 'succeeded')
+        record = self.exercise_worker()
+        self.assertEqual(record['state'], 'succeeded')
+        self.assertFalse(record['model_mismatch'])
+        self.assertNotIn('warning', record['stderr'])
+
+    def test_served_model_mismatch_is_recorded_and_announced(self):
+        record = self.exercise_worker(served='gpt-substitute')
+        self.assertTrue(record['model_mismatch'])
+        self.assertIn('warning: requested gpt-5.6-sol but gpt-substitute answered',
+                      record['stderr'])
+        self.assertFalse(self.exercise_worker(served='gpt-5.6-sol')['model_mismatch'])
+
+    def test_model_matching_ignores_context_suffix_and_floating_aliases(self):
+        self.assertTrue(w.model_matches('claude-opus-5-5[1m]', 'claude-opus-5-5'))
+        self.assertTrue(w.model_matches('sonnet', 'claude-sonnet-5-5'))
+        self.assertTrue(w.model_matches('gpt-5.6-sol', None))
+        self.assertFalse(w.model_matches('claude-fable-5-1', 'claude-opus-5-5'))
+        self.assertFalse(w.model_matches('sonnet', 'claude-opus-5-5'))
+        self.assertEqual(w.route_line({'alias': 'opus-5.5', 'model': 'claude-opus-5-5[1m]'},
+                                      'review', 'abc', escalation=True),
+                         'agent-run: review → opus-5.5 (claude-opus-5-5[1m]) [escalation] · run abc')
+
+    def test_run_log_spans_projects_newest_first_and_flags_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
+            repos = [Path(temp) / name for name in ('alpha', 'beta')]
+            records = [
+                (repos[0], '000000000001', '2026-09-30T01:00:00+00:00', 'claude-fable-5-1',
+                 'claude-opus-5-5', {'total_tokens': 1200}, 0.5),
+                (repos[1], '000000000002', '2026-09-30T02:00:00+00:00', 'gpt-5.6-sol',
+                 None, None, None)]
+            for repo, run_id, created, model, observed, usage, cost in records:
+                repo.mkdir()
+                _, folder = w.project(repo)
+                w.write_json(folder / 'runs' / run_id / 'run.json', {
+                    'id': run_id, 'repo': str(repo.resolve()), 'role': 'review',
+                    'alias': 'x', 'model': model, 'state': 'succeeded',
+                    'created_at': created, 'observed_model': observed,
+                    'usage': usage, 'provider_cost_usd': cost})
+            (Path(temp) / 'state' / 'projects' / 'junk' / 'runs' / 'bad').mkdir(parents=True)
+            (Path(temp) / 'state' / 'projects' / 'junk' / 'runs' / 'bad' / 'run.json').write_text('{')
+            rows = w.run_log()
+            self.assertEqual([row['run_id'] for row in rows], ['000000000002', '000000000001'])
+            self.assertEqual([row['model_mismatch'] for row in rows], [False, True])
+            self.assertEqual([row['run_id'] for row in w.run_log(repos[0])], ['000000000001'])
+            self.assertEqual(len(w.run_log(limit=1)), 1)
+            text = w.format_run_log(rows)
+            self.assertIn('claude-opus-5-5 !', text)
+            self.assertIn('1,200', text)
+            self.assertIn('$0.50', text)
+            self.assertIn('served model not reported', text)
+            self.assertEqual(w.format_run_log([]), 'No agent-run runs recorded.')
 
     def test_process_failure_preserves_record_and_releases_lease(self):
         self.assertEqual(self.exercise_worker(exit_code=2)['state'], 'failed')
