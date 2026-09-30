@@ -41,7 +41,10 @@ conventions before adding configuration or a task ledger.
    checks, and existing authorization. Name the owner of integration. Assigned
    workers complete their scope without recursively creating another coordination
    layer. Use separate worktrees or isolated working copies for concurrent
-   writers; otherwise serialize edits.
+   writers; otherwise serialize edits. Before each dispatch, state the route in
+   one line (`role → alias (model)`); skip this for work kept in the session.
+   When a run reports a served model that differs from the requested one, say
+   so plainly.
 3. Inspect results and perform checks proportional to the change. A successful
    worker response is not evidence that acceptance checks passed. Use independent
    review when risk or the user's preferences warrant it, not for every task.
