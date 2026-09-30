@@ -34,6 +34,15 @@ class SkillPackageTests(unittest.TestCase):
                     'provider': 'host', 'model': 'inherit'})
             self.assertFalse((installed / 'models.json').exists())
 
+    def test_stats_skill_is_user_invoked_and_runs_the_panel(self):
+        text = (SKILL.parent / 'agent-workflow-stats' / 'SKILL.md').read_text()
+        header = text.split('---')[1]
+        self.assertIn('name: agent-workflow-stats', header)
+        self.assertIn('disable-model-invocation: true', header)
+        self.assertIn('allowed-tools: Bash(agent-run stats:*)', header)
+        self.assertIn('!`agent-run stats --panel $ARGUMENTS`', text)
+        self.assertRegex(header.split('name: ')[1].split()[0], r'^[a-z0-9-]+$')
+
 
 if __name__ == '__main__':
     unittest.main()

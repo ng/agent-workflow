@@ -54,6 +54,13 @@ The schema is:
   otherwise `roles.review` remains selected.
 - `escalation`: role-to-alias mappings. Use `{}` when no escalation route is
   desired.
+- `models.<alias>.price` (optional): `{ "input", "output", "cached_input",
+  "cache_write" }` in USD per 1M tokens; `input` and `output` are required and
+  the cache rates default to `input`. Used only by `agent-run stats`.
+- `prices` (optional): the same price objects keyed by model ID, for models no
+  longer assigned to an alias, so lifetime stats can still price their runs.
+- `baseline` (optional): alias for the unrouted estimate in `agent-run stats`.
+  Defaults to `roles.complex`.
 - `worker_packet_bytes` and `dispatch_limits`: positive integer safeguards.
   Limits are user-configured and persist per task UUID.
 - `binaries`: commands for `ygg` and the providers referenced by `models`.
@@ -130,6 +137,7 @@ agent-run run repo-42 --repo /path/to/repo --role implement
 agent-run verify RUN_ID --repo /path/to/repo --status passed --evidence-file /path/checks.md
 agent-run report --repo /path/to/repo
 agent-run log [--repo /path/to/repo] [--limit 20] [--json]
+agent-run stats [--session [ID]] [--repo PATH] [--task REF] [--since 7d] [--baseline ALIAS] [--panel | --plain] [--brief] [--json]
 agent-run handoff repo-42 --repo /path/to/repo --file /path/handoff.md
 agent-run remember --repo /path/to/repo --text 'Verified fact' --source 'path/task'
 agent-run finish repo-42 --repo /path/to/repo --reason 'Acceptance verified'
@@ -149,6 +157,26 @@ ignored, and bare family aliases such as `sonnet` match any model in that
 family). `agent-run log` shows recent runs across all projects, newest first,
 with requested and served models, state, tokens, cost, and run ID. Codex does
 not currently report the served model, so those rows show `-`.
+
+`agent-run stats` rolls up runs by model (runs, outcomes, average time, input,
+cache-read, cache-write and output tokens, reported and estimated cost) and by
+role → alias, and estimates the unrouted cost: the same token counts priced as
+if every run had used the baseline alias. Runs whose model has no price, or
+that reported no usage, are listed as not compared. The estimate assumes
+identical token counts and does not measure quality.
+
+Scope is lifetime across all projects by default. `--session` limits it to the
+coordinating session: the `codex`/`claude` wrappers set
+`AGENT_WORKFLOW_SESSION` when they launch, and every `agent-run run` records
+it (Claude Code's own `CLAUDE_CODE_SESSION_ID` is the fallback). Runs from
+before session tracking, or from sessions started with `command codex`, have no
+session. `--brief` prints one line; with `--session` it adds a lifetime line.
+
+In a terminal, `agent-run stats` draws a boxed panel with usage bars (colour
+unless `NO_COLOR` is set); piped output, which is what agents read, stays plain.
+`--panel` and `--plain` force either view. In Claude Code, `/agent-workflow-stats
+[args]` runs the panel and shows it verbatim; colour does not survive the chat
+view.
 
 Run the local checks with:
 

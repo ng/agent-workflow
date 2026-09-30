@@ -57,4 +57,8 @@ elapsed time, retries, and verification. Treat missing telemetry as unknown.
 `agent-run run` prints the route (`role → alias (model)`) to stderr at dispatch
 and warns when the provider reports a different model than requested; relay
 that warning to the user. `agent-run log` lists recent runs across projects
-with requested and served models.
+with requested and served models. `agent-run stats` rolls up routing, tokens,
+cost, and an unrouted estimate (lifetime by default; `--session`, `--repo`,
+`--task`, `--since` narrow it). When a task dispatched workers, end the final
+report with the output of `agent-run stats --session --brief`, and use the full
+`agent-run stats` when the user asks about routing, usage, or spend.

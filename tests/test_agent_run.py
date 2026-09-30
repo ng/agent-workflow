@@ -165,6 +165,19 @@ class WorkflowTests(unittest.TestCase):
             execute.assert_called_once_with('/custom path/codex',
                                             ['/custom path/codex', '--version'])
 
+    def test_launch_tags_session_for_dispatched_workers(self):
+        with patch.object(w.os, 'execvp', side_effect=SystemExit), \
+                patch.object(w, 'context', return_value=''), \
+                patch.dict(os.environ, {'AGENT_WORKFLOW_SESSION': 'stale'}):
+            with self.assertRaises(SystemExit):
+                w.launch('claude', [])
+            self.assertRegex(os.environ['AGENT_WORKFLOW_SESSION'], r'^claude-[0-9a-f]{12}$')
+            self.assertEqual(w.current_session()['source'], 'agent-run launch')
+        with patch.dict(os.environ, {'AGENT_WORKFLOW_SESSION': '', 'CLAUDE_CODE_SESSION_ID': 'abc'}):
+            self.assertEqual(w.current_session(), {'id': 'claude-abc', 'source': 'claude'})
+        with patch.dict(os.environ, {'AGENT_WORKFLOW_SESSION': '', 'CLAUDE_CODE_SESSION_ID': ''}):
+            self.assertIsNone(w.current_session())
+
     def test_launch_rejects_unsupported_provider(self):
         with self.assertRaisesRegex(ValueError, 'Unknown provider'):
             w.launch('custom', [])
@@ -245,7 +258,8 @@ class WorkflowTests(unittest.TestCase):
             with patch.object(w, 'config', return_value=cfg), \
                  patch.object(w, 'show', return_value=task), \
                  patch.object(w, 'context', return_value='saved'), \
-                 patch.dict(os.environ, {'AGENT_WORKFLOW_WORKER': ''}), \
+                 patch.dict(os.environ, {'AGENT_WORKFLOW_WORKER': '',
+                                         'AGENT_WORKFLOW_SESSION': 'codex-test'}), \
                  self.assertRaisesRegex(RuntimeError, 'limit is 1'):
                 w.run_worker(args, repo)
             self.assertFalse((Path(temp) / 'state').exists())
@@ -406,7 +420,8 @@ class WorkflowTests(unittest.TestCase):
                  patch.object(w, 'ygg', side_effect=fake_ygg), patch.object(w, 'append_notes'), \
                  patch.object(w, 'worker_command', side_effect=command), \
                  patch.object(w, 'call', return_value=types.SimpleNamespace(returncode=0, stdout=str(repo))), \
-                 patch.dict(os.environ, {'AGENT_WORKFLOW_WORKER': ''}), \
+                 patch.dict(os.environ, {'AGENT_WORKFLOW_WORKER': '',
+                                         'AGENT_WORKFLOW_SESSION': 'codex-test'}), \
                  contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()) as stderr:
                 if exit_code or timeout:
@@ -426,6 +441,7 @@ class WorkflowTests(unittest.TestCase):
             if not served:
                 self.assertIsNone(record['telemetry']['provenance']['model'])
             run_id = record['id']
+            self.assertEqual(record['session'], {'id': 'codex-test', 'source': 'agent-run launch'})
             self.assertIn(f'agent-run: implement → sol (gpt-5.6-sol) · run {run_id}',
                           stderr.getvalue())
             record['stderr'] = stderr.getvalue()
@@ -453,6 +469,216 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(w.route_line({'alias': 'opus-5.5', 'model': 'claude-opus-5-5[1m]'},
                                       'review', 'abc', escalation=True),
                          'agent-run: review → opus-5.5 (claude-opus-5-5[1m]) [escalation] · run abc')
+
+    def test_token_parts_and_pricing(self):
+        claude = w.token_parts({'input_tokens': 10, 'cached_input_tokens': 100,
+                                'cache_creation_input_tokens': 20, 'output_tokens': 4}, 'claude')
+        self.assertEqual(claude, {'input': 10, 'cached_input': 100, 'cache_write': 20, 'output': 4})
+        codex = w.token_parts({'input_tokens': 110, 'cached_input_tokens': 100,
+                               'output_tokens': 4}, 'codex')
+        self.assertEqual(codex, {'input': 10, 'cached_input': 100, 'cache_write': 0, 'output': 4})
+        self.assertIsNone(w.token_parts(None, 'codex'))
+        self.assertIsNone(w.token_parts({'output_tokens': 1}, 'claude'))
+        parts = {'input': 1_000_000, 'cached_input': 1_000_000, 'cache_write': 1_000_000,
+                 'output': 1_000_000}
+        self.assertAlmostEqual(w.price_cost(parts, {'input': 4, 'output': 20, 'cached_input': 0.2,
+                                                    'cache_write': 8}), 32.2)
+        self.assertAlmostEqual(w.price_cost(parts, {'input': 2, 'output': 10}), 16)
+        cfg = w.config()
+        self.assertEqual(w._price_for(cfg, 'claude-opus-4-6[1m]')['input'], 5)
+        self.assertEqual(w._price_for(cfg, 'sonnet')['input'], 2)
+        self.assertEqual(w._price_for(cfg, 'sonnet', 'claude-opus-5-5')['input'], 4)
+        self.assertIsNone(w._price_for(cfg, 'gpt-5.6-sol'))
+        self.assertIsNone(w._price_for(cfg, 'sonnet', 'claude-sonnet-4-6'))
+
+    def test_price_and_baseline_config_are_validated(self):
+        for change, message in [
+                (lambda c: c['models']['sol'].update(price={'input': 1}), 'needs input and output'),
+                (lambda c: c['models']['sol'].update(price={'input': 1, 'output': -1}), 'nonnegative'),
+                (lambda c: c['models']['sol'].update(price={'input': 1, 'output': 1, 'x': 1}), 'not one of'),
+                (lambda c: c.update(prices={'m': {'input': True, 'output': 1}}), 'nonnegative'),
+                (lambda c: c['models']['sol'].update(price={'input': float('nan'), 'output': 1}), 'finite'),
+                (lambda c: c.update(prices={'m': {'input': 1, 'output': float('inf')}}), 'finite'),
+                (lambda c: c.update(baseline='missing'), 'baseline refers')]:
+            cfg = deepcopy(w.config())
+            change(cfg)
+            with self.assertRaisesRegex(ValueError, message):
+                w._validate_config(cfg)
+
+    def test_stats_roll_up_by_model_route_scope_and_baseline(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
+            repo = Path(temp) / 'repo'
+            repo.mkdir()
+            _, folder = w.project(repo)
+            runs = [
+                ('000000000001', 'review', 'opus-5.5', 'claude-opus-5-5[1m]', 'claude', 's1', 't-1',
+                 'succeeded', 'claude-opus-5-5', {'input_tokens': 1_000_000, 'output_tokens': 0}, 4.0),
+                ('000000000002', 'explore', 'sonnet', 'claude-sonnet-5-5[1m]', 'claude', 's1', 't-1',
+                 'succeeded', 'claude-sonnet-5-5', {'input_tokens': 1_000_000, 'output_tokens': 0}, 2.0),
+                ('000000000003', 'implement', 'sol', 'gpt-5.6-sol', 'codex', 's2', 't-2',
+                 'failed', None, {'input_tokens': 5, 'cached_input_tokens': 2, 'output_tokens': 1}, None),
+                ('000000000004', 'implement', 'sol', 'gpt-5.6-sol', 'codex', None, 't-2',
+                 'succeeded', None, None, None)]
+            for i, (run_id, role, alias, model, provider, session, task, state, observed,
+                    usage, cost) in enumerate(runs):
+                w.write_json(folder / 'runs' / run_id / 'run.json', {
+                    'id': run_id, 'repo': str(repo.resolve()), 'role': role, 'alias': alias,
+                    'model': model, 'provider': provider, 'task': task, 'state': state,
+                    'session': {'id': session, 'source': 'test'} if session else None,
+                    'created_at': f'2026-09-2{i}T00:00:00+00:00', 'elapsed_seconds': 10,
+                    'dispatch': {'escalation': i == 1, 'retry': False},
+                    'observed_model': observed, 'usage': usage, 'provider_cost_usd': cost})
+            stats = w.run_stats()
+            self.assertEqual(stats['totals']['runs'], 4)
+            self.assertEqual(stats['totals']['escalations'], 1)
+            self.assertEqual(stats['totals']['reported_cost_usd'], 6.0)
+            self.assertEqual(stats['routing']['implement'], {'sol': 2})
+            sol = next(b for b in stats['by_model'] if b['alias'] == 'sol')
+            self.assertEqual((sol['runs'], sol['states']), (2, {'failed': 1, 'succeeded': 1}))
+            self.assertEqual(sol['tokens']['input'], 3)
+            self.assertEqual((sol['priced_runs'], sol['unpriced_runs'], sol['usage_runs']), (0, 1, 1))
+            comparison = stats['comparison']
+            self.assertEqual(comparison['baseline'], 'opus-5.5')
+            self.assertEqual(comparison['runs'], 2)
+            self.assertAlmostEqual(comparison['routed_usd'], 6.0)
+            self.assertAlmostEqual(comparison['baseline_usd'], 8.0)
+            self.assertEqual(comparison['unpriced_models'], ['gpt-5.6-sol'])
+            self.assertEqual(comparison['no_usage_runs'], 1)
+            self.assertEqual(w.run_stats(session='s1')['totals']['runs'], 2)
+            self.assertEqual(w.run_stats(task='t-2')['totals']['runs'], 2)
+            self.assertEqual(w.run_stats(since='2026-09-22T00:00:00+00:00')['totals']['runs'], 2)
+            self.assertAlmostEqual(w.run_stats(baseline='sonnet')['comparison']['baseline_usd'], 4.0)
+            with self.assertRaisesRegex(ValueError, 'Unknown baseline'):
+                w.run_stats(baseline='missing')
+            with self.assertRaisesRegex(ValueError, 'since must'):
+                w.parse_since('soon')
+            text = w.format_stats(stats)
+            self.assertIn('saved     $2.00 (25%) across 2 priced runs', text)
+            self.assertIn('implement  sol ×2', text)
+            self.assertIn('Not compared (no price): gpt-5.6-sol', text)
+            self.assertIn('no price', text)
+            self.assertIn('extra     $2.00 (50% more than all-sonnet)',
+                          w.format_stats(w.run_stats(baseline='sonnet')))
+            brief = w.brief_stats(w.run_stats(session='s1'))
+            self.assertIn('session s1: 2 runs (2 ok) · 2.0M tokens · $6.00 reported', brief)
+            self.assertIn('vs all-opus-5.5 $8.00 (-25%, 2 priced runs)', brief)
+            self.assertIn('No runs in this scope.', w.format_stats(w.run_stats(session='none')))
+
+    def write_runs(self, folder, repo, runs):
+        for i, extra in enumerate(runs):
+            run_id = f'{i:012x}'
+            w.write_json(folder / 'runs' / run_id / 'run.json', {
+                'id': run_id, 'repo': str(repo.resolve()), 'role': 'review', 'alias': 'opus-5.5',
+                'model': 'claude-opus-5-5[1m]', 'provider': 'claude', 'state': 'succeeded',
+                'created_at': f'2026-09-2{i}T00:00:00+00:00', **extra})
+
+    def test_stats_review_regressions(self):
+        million = {'input_tokens': 1_000_000, 'output_tokens': 0}
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
+            repo = Path(temp) / 'repo'
+            repo.mkdir()
+            _, folder = w.project(repo)
+            # Mixed-model Claude run: each model's usage is priced at its own rate.
+            self.write_runs(folder, repo, [{
+                'observed_model': 'claude-opus-5-5', 'usage': million,
+                'observed_models': [
+                    {'model': 'claude-opus-5-5', 'usage': million},
+                    {'model': 'claude-sonnet-5-5', 'usage': million}]}])
+            stats = w.run_stats()
+            self.assertAlmostEqual(stats['comparison']['routed_usd'], 6.0)
+            self.assertAlmostEqual(stats['comparison']['baseline_usd'], 8.0)
+            self.assertEqual(stats['totals']['total_tokens'], 2_000_000)
+            # A helper model without a price leaves the run unpriced instead of mispriced.
+            self.write_runs(folder, repo, [{'observed_models': [
+                {'model': 'claude-opus-5-5', 'usage': million},
+                {'model': 'claude-haiku-4-5', 'usage': million}]}])
+            self.assertEqual(w.run_stats()['comparison']['unpriced_models'], ['claude-haiku-4-5'])
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
+            repo = Path(temp) / 'repo'
+            repo.mkdir()
+            _, folder = w.project(repo)
+            # Order independence, active runs, missing usage, legacy provider.
+            self.write_runs(folder, repo, [
+                {'state': 'running', 'usage': None},
+                {'usage': million, 'observed_model': 'claude-opus-5-5'},
+                {'alias': 'sol', 'model': 'gpt-5.6-sol', 'provider': None,
+                 'telemetry': {'provider': 'codex'},
+                 'usage': {'input_tokens': 110, 'cached_input_tokens': 100, 'output_tokens': 4}}])
+            stats = w.run_stats()
+            opus = next(b for b in stats['by_model'] if b['alias'] == 'opus-5.5')
+            self.assertEqual((opus['priced_runs'], opus['usage_runs']), (1, 1))
+            sol = next(b for b in stats['by_model'] if b['alias'] == 'sol')
+            self.assertEqual(sol['total_tokens'], 114)
+            text = w.format_stats(stats)
+            self.assertIn('4.00 (1/2)', text)
+            self.assertRegex(text, r'opus-5\.5\s+claude-opus-5-5\[1m\]\s+2\s+1\s+0\s')
+            self.assertIn('(1 runs without usage)', w.brief_stats(stats))
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
+            repo = Path(temp) / 'repo'
+            repo.mkdir()
+            _, folder = w.project(repo)
+            self.write_runs(folder, repo, [{'usage': million, 'observed_model': 'claude-opus-5-5'}])
+            # Baseline resolves prices the same way routed runs do.
+            cfg = deepcopy(w.config())
+            cfg['prices'] = {'claude-opus-5-5': {'input': 3, 'output': 15}}
+            with patch.object(w, 'config', return_value=cfg):
+                comparison = w.run_stats()['comparison']
+            self.assertAlmostEqual(comparison['routed_usd'], comparison['baseline_usd'])
+            # A free baseline does not produce a percentage.
+            cfg['prices'] = {'claude-sonnet-5-5': {'input': 0, 'output': 0}}
+            with patch.object(w, 'config', return_value=cfg):
+                stats = w.run_stats(baseline='sonnet')
+            self.assertIn('extra     $4.00 (baseline is free)', w.format_stats(stats))
+            self.assertIn('vs all-sonnet $0.00 (1 priced runs)', w.brief_stats(stats))
+
+    def test_panel_is_boxed_fits_width_and_colors_only_on_request(self):
+        stats = {
+            'scope': {'repo': None, 'session': 'claude-70294008-09c9-4323-a813-ed0d1c824da3',
+                      'task': None, 'since': None},
+            'totals': {'runs': 4, 'states': {'succeeded': 3, 'failed': 1}, 'escalations': 1,
+                       'retries': 0, 'mismatches': 0,
+                       'tokens': {'cache_write': 0, 'cached_input': 900, 'output': 50, 'input': 50},
+                       'total_tokens': 1000, 'usage_known_runs': 3, 'reported_cost_usd': 1.5,
+                       'reported_cost_runs': 1},
+            'by_model': [
+                {'alias': 'sol', 'model': 'gpt-5.6-sol', 'runs': 3, 'total_tokens': 600,
+                 'usage_runs': 2, 'priced_runs': 0, 'unpriced_runs': 2, 'estimated_cost_usd': 0},
+                {'alias': 'opus-5.5', 'model': 'claude-opus-5-5[1m]', 'runs': 1, 'total_tokens': 400,
+                 'usage_runs': 1, 'priced_runs': 1, 'unpriced_runs': 0, 'estimated_cost_usd': 1.5}],
+            'routing': {'implement': {'sol': 3}, 'review': {'opus-5.5': 1}},
+            'comparison': {'baseline': 'opus-5.5', 'baseline_model': 'claude-opus-5-5[1m]',
+                           'baseline_priced': True, 'runs': 1, 'routed_usd': 1.5,
+                           'baseline_usd': 1.5, 'unpriced_models': ['gpt-5.6-sol'],
+                           'no_usage_runs': 1}}
+        for width in (60, 80, 100, 140):
+            panel = w.format_panel(stats, width)
+            lines = panel.splitlines()
+            self.assertEqual({len(line) for line in lines}, {min(max(width, 60), 100)})
+            self.assertTrue(lines[0].startswith('╭') and lines[-1].startswith('╰'))
+            self.assertNotIn('\033[', panel)
+        wide = w.format_panel(stats, 80)
+        self.assertIn('session claude-70294008)', wide)
+        self.assertIn('Success:    ███████████████░░░░░ 75%', wide)
+        self.assertIn('─ Unrouted estimate · all on opus-5.5 ', wide)
+        self.assertIn('saved     $0.00 (0%) across 1 priced runs', wide)
+        self.assertIn('no price', wide)
+        self.assertIn('1 runs reported no usage', wide)
+        self.assertNotIn('█', w.format_panel(stats, 64))
+        self.assertIn('\033[32m', w.format_panel(stats, 80, color=True))
+        empty = dict(stats, totals={**stats['totals'], 'runs': 0})
+        self.assertIn('No runs in this scope.', w.format_panel(empty, 80))
+        self.assertEqual(w._bar(0.5, 4), '██░░')
+        self.assertEqual(w._bar(2, 4), '████')
+
+    def test_stats_cli_picks_plain_when_piped_and_panel_on_request(self):
+        env = {**os.environ, 'AGENT_WORKFLOW_STATE': str(Path(tempfile.mkdtemp()))}
+        run = lambda *extra: subprocess.run(
+            [os.sys.executable, str(WORKFLOW_ROOT / 'agent_run.py'), 'stats', *extra],
+            env=env, text=True, capture_output=True)
+        self.assertIn('No runs in this scope.', run().stdout)
+        self.assertFalse(run().stdout.startswith('╭'))
+        self.assertTrue(run('--panel').stdout.startswith('╭'))
+        self.assertNotEqual(run('--panel', '--plain').returncode, 0)
 
     def test_run_log_spans_projects_newest_first_and_flags_mismatch(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
@@ -518,6 +744,8 @@ class InstallerTests(unittest.TestCase):
                              (checkout / 'agent_run.py').resolve())
             self.assertEqual((skill_dir / 'agent-workflow').resolve(),
                              (checkout / 'skills/agent-workflow').resolve())
+            self.assertEqual((skill_dir / 'agent-workflow-stats').resolve(),
+                             (checkout / 'skills/agent-workflow-stats').resolve())
             self.assertEqual(models.read_text(), 'personal models\n')
             self.assertEqual(agents.read_text(), 'personal policy\n')
 
@@ -538,7 +766,7 @@ class InstallerTests(unittest.TestCase):
             root = Path(temp)
             shell_tools = root / 'shell-tools'
             shell_tools.mkdir()
-            for command in ('bash', 'dirname', 'mkdir', 'ln'):
+            for command in ('bash', 'basename', 'dirname', 'mkdir', 'ln'):
                 (shell_tools / command).symlink_to(shutil.which(command))
             env = {**os.environ, 'PATH': str(shell_tools),
                    'AGENT_WORKFLOW_CONFIG': str(root / 'absent-config')}

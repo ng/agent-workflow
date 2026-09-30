@@ -26,7 +26,12 @@ the complete directory to `~/.claude/skills/agent-workflow`, then invoke
 existing installation before replacing it. Claude Code's official documentation
 covers [skill directories, references, symlinks, and invocation](https://code.claude.com/docs/en/skills).
 
-An optional Bash helper installs only the skill by default:
+The optional [`skills/agent-workflow-stats`](skills/agent-workflow-stats) skill
+adds `/agent-workflow-stats` in Claude Code. It renders `agent-run stats --panel`
+(routing, tokens, cost, and an unrouted estimate) and needs the optional runner.
+Arguments pass through, for example `/agent-workflow-stats --session`.
+
+An optional Bash helper installs the skills by default:
 
 ```sh
 ./install.sh --skill-dir "$HOME/.codex/skills"

@@ -61,11 +61,14 @@ if [[ $workflow_with_runner == true ]]; then
   install_link "$workflow_source_dir/agent_run.py" "$workflow_bin_dir/agent-run"
 fi
 for workflow_skill_dir in "${workflow_skill_dirs[@]}"; do
-  install_link "$workflow_source_dir/skills/agent-workflow" \
-    "$workflow_skill_dir/agent-workflow"
+  for workflow_skill in "$workflow_source_dir"/skills/*/; do
+    workflow_skill=${workflow_skill%/}
+    [[ -f $workflow_skill/SKILL.md ]] || continue
+    install_link "$workflow_skill" "$workflow_skill_dir/$(basename -- "$workflow_skill")"
+  done
 done
 
-printf 'Installed Agent Workflow skill from %s\n' "$workflow_source_dir"
+printf 'Installed Agent Workflow skills from %s\n' "$workflow_source_dir"
 if [[ $workflow_with_runner != true ]]; then
   exit 0
 fi
