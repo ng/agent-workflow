@@ -58,7 +58,23 @@ elapsed time, retries, and verification. Treat missing telemetry as unknown.
 and warns when the provider reports a different model than requested; relay
 that warning to the user. `agent-run log` lists recent runs across projects
 with requested and served models. `agent-run stats` rolls up routing, tokens,
-cost, and an unrouted estimate (lifetime by default; `--session`, `--repo`,
+cost, quality signals per route, and whether cost roles save money against the
+baseline model (lifetime by default; `--session`, `--repo`,
 `--task`, `--since` narrow it). When a task dispatched workers, end the final
 report with the output of `agent-run stats --session --brief`, and use the full
 `agent-run stats` when the user asks about routing, usage, or spend.
+
+Costs come from `pricing.json`, a dated list-price baseline shipped with the
+runner; prices in `models.json` (`models.<alias>.price`, `prices`) override it
+for negotiated rates. `agent-run prices` shows its age, sources, and any
+unpriced alias. When stats or `agent-run prices` reports stale prices or an
+unpriced alias, refresh the baseline:
+
+1. Fetch every source URL listed in `pricing.json`.
+2. Confirm each new or changed model on its own model page (OpenAI) or in the
+   model pricing table (Anthropic). Never guess or extrapolate a price; leave a
+   model out when no official page confirms it.
+3. Update `models` and set `as_of` to today; keep the notes accurate (cache-write
+   multiplier, long-context and promotional terms).
+4. Run the runner's tests and report old versus new prices. Committing the
+   change still needs the user's authorization.

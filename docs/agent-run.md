@@ -56,11 +56,17 @@ The schema is:
   desired.
 - `models.<alias>.price` (optional): `{ "input", "output", "cached_input",
   "cache_write" }` in USD per 1M tokens; `input` and `output` are required and
-  the cache rates default to `input`. Used only by `agent-run stats`.
+  the cache rates default to `input`. Used only by `agent-run stats`, and only
+  needed to override the shipped `pricing.json` baseline (for example with
+  negotiated rates).
 - `prices` (optional): the same price objects keyed by model ID, for models no
   longer assigned to an alias, so lifetime stats can still price their runs.
-- `baseline` (optional): alias for the unrouted estimate in `agent-run stats`.
-  Defaults to `roles.complex`.
+- `baseline` (optional): the quality model that `agent-run stats` compares
+  against ("same tokens on this model for everything"). Defaults to
+  `roles.complex`.
+- `quality_roles` (optional): roles that pay for a stronger model on purpose.
+  Defaults to `plan`, `debug`, `complex`, `review`; the other roles are cost
+  roles, which are expected to cost less than the baseline.
 - `worker_packet_bytes` and `dispatch_limits`: positive integer safeguards.
   Limits are user-configured and persist per task UUID.
 - `binaries`: commands for `ygg` and the providers referenced by `models`.
@@ -137,6 +143,7 @@ agent-run run repo-42 --repo /path/to/repo --role implement
 agent-run verify RUN_ID --repo /path/to/repo --status passed --evidence-file /path/checks.md
 agent-run report --repo /path/to/repo
 agent-run log [--repo /path/to/repo] [--limit 20] [--json]
+agent-run prices [--json]
 agent-run stats [--session [ID]] [--repo PATH] [--task REF] [--since 7d] [--baseline ALIAS] [--panel | --plain] [--brief] [--json]
 agent-run handoff repo-42 --repo /path/to/repo --file /path/handoff.md
 agent-run remember --repo /path/to/repo --text 'Verified fact' --source 'path/task'
@@ -158,12 +165,24 @@ family). `agent-run log` shows recent runs across all projects, newest first,
 with requested and served models, state, tokens, cost, and run ID. Codex does
 not currently report the served model, so those rows show `-`.
 
-`agent-run stats` rolls up runs by model (runs, outcomes, average time, input,
-cache-read, cache-write and output tokens, reported and estimated cost) and by
-role → alias, and estimates the unrouted cost: the same token counts priced as
-if every run had used the baseline alias. Runs whose model has no price, or
-that reported no usage, are listed as not compared. The estimate assumes
-identical token counts and does not measure quality.
+`agent-run stats` answers four questions:
+
+- **Is anything wrong?** Checks list what needs attention: a cost role that
+  costs more than the baseline would for the same tokens (with cheaper models
+  from other cost roles as alternatives), a route with at least 5 runs and under
+  80% success or 80% verification passes, runs missing usage (over 5%), stale or
+  missing prices, and model mismatches. Passing checks fold into one line.
+- **Is routing working?** Per role → model: succeeded/runs, success rate,
+  coordinator verification results from `agent-run verify`, cost per
+  successful run, and escalations.
+- **Where does the money go?** Estimated cost per alias at list prices, with
+  cost per run, runs, and tokens (model-ID variants of one alias combined).
+- **Did cheaper models save money?** Each role's cost compared with the same
+  tokens on the baseline model, split into cost roles (expected to save) and
+  quality roles (stronger models by design, never flagged), then the total.
+
+Estimates assume identical token counts and do not measure quality; runs
+without usage or a price are excluded and counted.
 
 Scope is lifetime across all projects by default. `--session` limits it to the
 coordinating session: the `codex`/`claude` wrappers set
@@ -171,6 +190,15 @@ coordinating session: the `codex`/`claude` wrappers set
 it (Claude Code's own `CLAUDE_CODE_SESSION_ID` is the fallback). Runs from
 before session tracking, or from sessions started with `command codex`, have no
 session. `--brief` prints one line; with `--session` it adds a lifetime line.
+
+Prices come from `pricing.json` next to `agent_run.py`: standard API list
+prices as of its `as_of` date, with source URLs and notes (Claude cache writes
+use the 1-hour rate; OpenAI prompts over 272K tokens cost more, which the
+estimate cannot see). Lookup order is `prices` in `models.json`, then an alias's
+`price`, then `pricing.json`; model IDs match ignoring `[1m]` and snapshot-date
+suffixes. `agent-run prices` lists the baseline's age and sources and flags
+unpriced aliases; stats marks prices stale after `stale_after_days` (30). Set
+`AGENT_WORKFLOW_PRICING` to use a different file.
 
 In a terminal, `agent-run stats` draws a boxed panel with usage bars (colour
 unless `NO_COLOR` is set); piped output, which is what agents read, stays plain.

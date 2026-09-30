@@ -18,6 +18,7 @@ EXAMPLE_CONFIG = WORKFLOW_ROOT / 'tests' / 'fixtures'
 TEST_STATE = Path(tempfile.mkdtemp(prefix='agent-workflow-tests-'))
 os.environ['AGENT_WORKFLOW_CONFIG'] = str(EXAMPLE_CONFIG)
 os.environ['AGENT_WORKFLOW_STATE'] = str(TEST_STATE)
+os.environ['AGENT_WORKFLOW_PRICING'] = str(TEST_STATE / 'no-pricing.json')
 spec = importlib.util.spec_from_file_location('workflow', WORKFLOW_ROOT / 'agent_run.py')
 w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
@@ -532,7 +533,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(stats['totals']['runs'], 4)
             self.assertEqual(stats['totals']['escalations'], 1)
             self.assertEqual(stats['totals']['reported_cost_usd'], 6.0)
-            self.assertEqual(stats['routing']['implement'], {'sol': 2})
+            route = stats['routing']['implement']['sol']
+            self.assertEqual((route['runs'], route['succeeded'], route['failed'], route['escalations']),
+                             (2, 1, 1, 0))
+            self.assertEqual([row['full_role'] for row in w.route_rows(stats)],
+                             ['explore', 'implement', 'review'])
             sol = next(b for b in stats['by_model'] if b['alias'] == 'sol')
             self.assertEqual((sol['runs'], sol['states']), (2, {'failed': 1, 'succeeded': 1}))
             self.assertEqual(sol['tokens']['input'], 3)
@@ -553,15 +558,18 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'since must'):
                 w.parse_since('soon')
             text = w.format_stats(stats)
-            self.assertIn('saved     $2.00 (25%) across 2 priced runs', text)
-            self.assertIn('implement  sol ×2', text)
+            self.assertIn('All runs: $6.00 yours vs $8.00 on opus-5.5. Your mix saved $2.00 (25%) '
+                          'versus using only opus-5.5.', text)
+            self.assertIn('  implement → sol: 1/2 50%', text)
+            self.assertIn('  explore → sonnet: 1/1 100%, $2.00/success (1 came via escalation)', text)
             self.assertIn('Not compared (no price): gpt-5.6-sol', text)
             self.assertIn('no price', text)
-            self.assertIn('extra     $2.00 (50% more than all-sonnet)',
+            self.assertIn('Your mix cost $2.00 (50% more) than using only sonnet would have.',
                           w.format_stats(w.run_stats(baseline='sonnet')))
             brief = w.brief_stats(w.run_stats(session='s1'))
-            self.assertIn('session s1: 2 runs (2 ok) · 2.0M tokens · $6.00 reported', brief)
-            self.assertIn('vs all-opus-5.5 $8.00 (-25%, 2 priced runs)', brief)
+            self.assertIn('session s1: 2 runs (2 ok) · 2.0M tokens · $6.00 est. at list prices · '
+                          '$6.00 reported', brief)
+            self.assertIn('your mix saved 25% versus using only opus-5.5', brief)
             self.assertIn('No runs in this scope.', w.format_stats(w.run_stats(session='none')))
 
     def write_runs(self, folder, repo, runs):
@@ -612,7 +620,7 @@ class WorkflowTests(unittest.TestCase):
             text = w.format_stats(stats)
             self.assertIn('4.00 (1/2)', text)
             self.assertRegex(text, r'opus-5\.5\s+claude-opus-5-5\[1m\]\s+2\s+1\s+0\s')
-            self.assertIn('(1 runs without usage)', w.brief_stats(stats))
+            self.assertIn('(1 run without usage)', w.brief_stats(stats))
         with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):
             repo = Path(temp) / 'repo'
             repo.mkdir()
@@ -624,51 +632,117 @@ class WorkflowTests(unittest.TestCase):
             with patch.object(w, 'config', return_value=cfg):
                 comparison = w.run_stats()['comparison']
             self.assertAlmostEqual(comparison['routed_usd'], comparison['baseline_usd'])
+            with patch.object(w, 'config', return_value=cfg):
+                self.assertIn('your mix cost the same as using only opus-5.5',
+                              w.brief_stats(w.run_stats()))
             # A free baseline does not produce a percentage.
             cfg['prices'] = {'claude-sonnet-5-5': {'input': 0, 'output': 0}}
             with patch.object(w, 'config', return_value=cfg):
                 stats = w.run_stats(baseline='sonnet')
-            self.assertIn('extra     $4.00 (baseline is free)', w.format_stats(stats))
-            self.assertIn('vs all-sonnet $0.00 (1 priced runs)', w.brief_stats(stats))
+            self.assertIn('Your mix cost $4.00 more than using only sonnet would have.',
+                          w.format_stats(stats))
+            self.assertIn('your mix cost more than using only sonnet', w.brief_stats(stats))
 
-    def test_panel_is_boxed_fits_width_and_colors_only_on_request(self):
-        stats = {
-            'scope': {'repo': None, 'session': 'claude-70294008-09c9-4323-a813-ed0d1c824da3',
-                      'task': None, 'since': None},
-            'totals': {'runs': 4, 'states': {'succeeded': 3, 'failed': 1}, 'escalations': 1,
-                       'retries': 0, 'mismatches': 0,
-                       'tokens': {'cache_write': 0, 'cached_input': 900, 'output': 50, 'input': 50},
-                       'total_tokens': 1000, 'usage_known_runs': 3, 'reported_cost_usd': 1.5,
-                       'reported_cost_runs': 1},
-            'by_model': [
-                {'alias': 'sol', 'model': 'gpt-5.6-sol', 'runs': 3, 'total_tokens': 600,
-                 'usage_runs': 2, 'priced_runs': 0, 'unpriced_runs': 2, 'estimated_cost_usd': 0},
-                {'alias': 'opus-5.5', 'model': 'claude-opus-5-5[1m]', 'runs': 1, 'total_tokens': 400,
-                 'usage_runs': 1, 'priced_runs': 1, 'unpriced_runs': 0, 'estimated_cost_usd': 1.5}],
-            'routing': {'implement': {'sol': 3}, 'review': {'opus-5.5': 1}},
-            'comparison': {'baseline': 'opus-5.5', 'baseline_model': 'claude-opus-5-5[1m]',
-                           'baseline_priced': True, 'runs': 1, 'routed_usd': 1.5,
-                           'baseline_usd': 1.5, 'unpriced_models': ['gpt-5.6-sol'],
-                           'no_usage_runs': 1}}
-        for width in (60, 80, 100, 140):
-            panel = w.format_panel(stats, width)
-            lines = panel.splitlines()
-            self.assertEqual({len(line) for line in lines}, {min(max(width, 60), 100)})
-            self.assertTrue(lines[0].startswith('╭') and lines[-1].startswith('╰'))
-            self.assertNotIn('\033[', panel)
+    def scenario_stats(self, temp):
+        """Cost roles that save and one that doesn't, a weak quality route, checks, gaps."""
+        repo = Path(temp) / 'repo'
+        repo.mkdir()
+        _, folder = w.project(repo)
+        cached = {'input_tokens': 1_000_000, 'cached_input_tokens': 900_000, 'output_tokens': 0}
+        runs = (
+            [('implement', 'sol', 'gpt-5.6-sol', 'codex', 'succeeded', cached, None, False)] * 3
+            + [('explore', 'sonnet', 'claude-sonnet-5-5[1m]', 'claude', 'succeeded',
+                {'input_tokens': 1_000_000, 'output_tokens': 0}, 'passed', False),
+               ('lookup', 'luna', 'gpt-5.6-luna', 'codex', 'succeeded',
+                {'input_tokens': 1_000_000, 'output_tokens': 0}, None, False)]
+            + [('complex', 'opus-5.5', 'claude-opus-5-5[1m]', 'claude', state,
+                {'input_tokens': 100_000, 'output_tokens': 0} if index < 3 else None,
+                'passed' if index == 0 else 'failed', False)
+               for index, state in enumerate(['succeeded', 'succeeded', 'failed', 'failed', 'failed'])]
+            + [('review', 'opus-5.5', 'claude-opus-5-5[1m]', 'claude', 'cancelled', None, None, True)])
+        for index, (role, alias, model, provider, state, usage, checked, escalation) in enumerate(runs):
+            run_id = f'{index:012x}'
+            w.write_json(folder / 'runs' / run_id / 'run.json', {
+                'id': run_id, 'repo': str(repo.resolve()), 'role': role, 'alias': alias,
+                'model': model, 'provider': provider, 'state': state, 'usage': usage,
+                'created_at': f'2026-09-{10 + index}T00:00:00+00:00', 'elapsed_seconds': 10,
+                'dispatch': {'escalation': escalation, 'retry': False}})
+            if checked:
+                w.write_json(folder / 'runs' / run_id / 'verification.json', {'status': checked})
+        return w.run_stats()
+
+    def test_checks_judge_cost_roles_and_quality_routes_by_intent(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'), \
+                patch.object(w, 'PRICING', WORKFLOW_ROOT / 'pricing.json'):
+            stats = self.scenario_stats(temp)
+        checks = w.stats_checks(stats)
+        flagged = [text for flag, text in checks if flag]
+        self.assertEqual(flagged[0], 'implement uses cheaper models but cost 31% more than opus-5.5 '
+                         'would for the same tokens ($2.28 vs $1.74); luna would cost $0.11, '
+                         'sonnet would cost $1.14')
+        self.assertIn('complex → opus-5.5 passed verification 1 of 5 (20%)', flagged)
+        self.assertIn('complex → opus-5.5 succeeded 2 of 5 (40%)', flagged)
+        self.assertIn('3 runs recorded no usage (opus-5.5 3); totals undercount', flagged)
+        self.assertFalse(any('review' in text for text in flagged))
+        ok = [text for flag, text in checks if not flag][0]
+        self.assertIn('cheaper models saving: lookup saved 95%, explore saved 50%', ok)
+        self.assertIn('prices current', ok)
+        roles = {row['role']: row for row in w.role_costs(stats)}
+        self.assertTrue(roles['complex']['quality'])
+        self.assertFalse(roles['implement']['quality'])
+        self.assertEqual(roles['complex']['result']['short'], 'same cost')
+        rows = w.route_rows(stats)
+        self.assertEqual([row['full_role'] for row in rows],
+                         ['lookup', 'explore', 'implement', 'complex', 'review'])
+        complex_row = next(row for row in rows if row['full_role'] == 'complex')
+        self.assertTrue(complex_row['weak'] and complex_row['weak_checks'])
+        self.assertEqual(complex_row['verified'], '1/5')
+        self.assertAlmostEqual(complex_row['per_success'], 0.6)
+        review_row = next(row for row in rows if row['full_role'] == 'review')
+        self.assertEqual(review_row['notes'][0][0], '1 came via escalation')
+        self.assertIn('your mix saved 48% versus using only opus-5.5', w.brief_stats(stats))
+
+    def test_panel_fits_every_width_without_cutting_words(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'), \
+                patch.object(w, 'PRICING', WORKFLOW_ROOT / 'pricing.json'):
+            stats = self.scenario_stats(temp)
+        for width in (60, 64, 72, 80, 100, 140):
+            with self.subTest(width=width):
+                panel = w.format_panel(stats, width)
+                lines = panel.splitlines()
+                self.assertEqual({len(line) for line in lines}, {min(max(width, 60), 100)})
+                self.assertTrue(lines[0].startswith('╭─ agent-run stats') and lines[-1].startswith('╰'))
+                self.assertNotIn('…', panel)
+                self.assertNotIn('\033[', panel)
         wide = w.format_panel(stats, 80)
-        self.assertIn('session claude-70294008)', wide)
-        self.assertIn('Success:    ███████████████░░░░░ 75%', wide)
-        self.assertIn('─ Unrouted estimate · all on opus-5.5 ', wide)
-        self.assertIn('saved     $0.00 (0%) across 1 priced runs', wide)
-        self.assertIn('no price', wide)
-        self.assertIn('1 runs reported no usage', wide)
+        order = ['─ Checks ', '─ Routes · quality by role ', '─ Models · share of estimated cost ',
+                 '─ Did cheaper models save money? · vs opus-5.5 for everything ']
+        self.assertEqual(sorted(order, key=wide.index), order)
+        self.assertIn('Runs      11 · 7 ok (64%) · 3 failed · 1 cancelled', wide)
+        self.assertIn('Tokens    5.3M: 2.7M cache read · 2.6M in', wide)
+        self.assertRegex(wide, r'│ !  complex +opus-5\.5 +2/5 +40% +1/5 +\$0\.60')
+        self.assertIn('Cost roles · cheaper models by design', wide)
+        self.assertLess(wide.index('Cost roles · cheaper'), wide.index('   role           yours'))
+        self.assertRegex(wide, r'│ !  implement +\$2\.28 +\$1\.74  cost 31% more')
+        self.assertIn('→ Your mix saved $5.26 (48%) versus using only opus-5.5.', wide)
+        self.assertIn('Ignores quality: opus-5.5 might not have done every job as well.', wide)
         self.assertNotIn('█', w.format_panel(stats, 64))
-        self.assertIn('\033[32m', w.format_panel(stats, 80, color=True))
-        empty = dict(stats, totals={**stats['totals'], 'runs': 0})
+        self.assertIn('\033[31m!  \033[0m', w.format_panel(stats, 80, color=True))
+        empty = w.run_stats(session='nobody')
         self.assertIn('No runs in this scope.', w.format_panel(empty, 80))
         self.assertEqual(w._bar(0.5, 4), '██░░')
         self.assertEqual(w._bar(2, 4), '████')
+
+    def test_plain_view_matches_panel_wording(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'), \
+                patch.object(w, 'PRICING', WORKFLOW_ROOT / 'pricing.json'):
+            stats = self.scenario_stats(temp)
+        text = w.format_stats(stats)
+        self.assertIn('  ! implement uses cheaper models but cost 31% more', text)
+        self.assertIn('  ! complex → opus-5.5: 2/5 40%, verified 1/5, $0.60/success', text)
+        self.assertIn('  ! cost role implement: $2.28 yours vs $1.74 on opus-5.5, cost 31% more', text)
+        self.assertIn('    quality role complex: $1.20 yours vs $1.20 on opus-5.5, same cost', text)
+        self.assertNotIn('│', text)
 
     def test_stats_cli_picks_plain_when_piped_and_panel_on_request(self):
         env = {**os.environ, 'AGENT_WORKFLOW_STATE': str(Path(tempfile.mkdtemp()))}
@@ -679,6 +753,48 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(run().stdout.startswith('╭'))
         self.assertTrue(run('--panel').stdout.startswith('╭'))
         self.assertNotEqual(run('--panel', '--plain').returncode, 0)
+
+    def test_shipped_pricing_baseline_is_valid_dated_and_sourced(self):
+        pricing = w.load_pricing(WORKFLOW_ROOT / 'pricing.json')
+        dt = w.dt
+        dt.date.fromisoformat(pricing['as_of'])
+        self.assertEqual({source['provider'] for source in pricing['sources']}, {'anthropic', 'openai'})
+        self.assertTrue(all(source['url'].startswith('https://') for source in pricing['sources']))
+        for model in ('claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1',
+                      'claude-haiku-4-5', 'gpt-5.6-sol', 'gpt-6-astra', 'gpt-5.6-luna'):
+            self.assertIn(model, pricing['models'])
+        cfg = w.config()
+        for alias, entry in cfg['models'].items():
+            with self.subTest(alias=alias):
+                self.assertIsNotNone(w._price_for(cfg, entry['model'], entry['model'], pricing))
+
+    def test_pricing_precedence_staleness_and_snapshot_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'pricing.json'
+            path.write_text(json.dumps({
+                'as_of': '2026-09-30', 'stale_after_days': 30,
+                'sources': [{'provider': 'x', 'url': 'https://example.com'}],
+                'models': {'claude-opus-5-5': {'input': 1, 'output': 1},
+                           'claude-haiku-4-5': {'input': 3, 'output': 3},
+                           'gpt-5.6-sol': {'input': 9, 'output': 9}}}))
+            pricing = w.load_pricing(path)
+            cfg = w.config()
+            # Config (alias price) overrides the baseline file.
+            self.assertEqual(w.price_lookup(cfg, 'claude-opus-5-5[1m]', None, pricing),
+                             (cfg['models']['opus-5.5']['price'], 'config'))
+            self.assertEqual(w.price_lookup(cfg, 'gpt-5.6-sol', None, pricing)[1], 'pricing.json')
+            self.assertEqual(w.price_lookup(cfg, 'x', 'claude-haiku-4-5-20251001', pricing)[0]['input'], 3)
+            self.assertEqual(w.price_lookup(cfg, 'gpt-unknown', None, pricing), (None, None))
+            status = w.pricing_status(pricing, today=w.dt.date(2026, 10, 30))
+            self.assertEqual((status['age_days'], status['stale']), (30, False))
+            self.assertTrue(w.pricing_status(pricing, today=w.dt.date(2026, 11, 1))['stale'])
+            self.assertIsNone(w.load_pricing(Path(temp) / 'missing.json'))
+            for bad in ({'models': {}}, {'as_of': 'soon', 'models': {}},
+                        {'as_of': '2026-09-30', 'models': {'m': {'input': 1}}}):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    w.load_pricing(path)
+        self.assertTrue(w.model_matches('claude-haiku-4-5', 'claude-haiku-4-5-20251001'))
 
     def test_run_log_spans_projects_newest_first_and_flags_mismatch(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(w, 'STATE', Path(temp) / 'state'):

@@ -28,7 +28,7 @@ covers [skill directories, references, symlinks, and invocation](https://code.cl
 
 The optional [`skills/agent-workflow-stats`](skills/agent-workflow-stats) skill
 adds `/agent-workflow-stats` in Claude Code. It renders `agent-run stats --panel`
-(routing, tokens, cost, and an unrouted estimate) and needs the optional runner.
+(checks, route quality, cost by model, and whether cheaper models saved money) and needs the optional runner.
 Arguments pass through, for example `/agent-workflow-stats --session`.
 
 An optional Bash helper installs the skills by default:

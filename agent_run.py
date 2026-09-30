@@ -31,11 +31,15 @@ def _config_dir():
 
 CONFIG = _config_dir()
 STATE = Path(os.environ.get('AGENT_WORKFLOW_STATE', CONFIG / 'state')).expanduser().resolve()
+PRICING = Path(os.environ.get('AGENT_WORKFLOW_PRICING', SOURCE_ROOT / 'pricing.json')).expanduser()
 READ_ROLES = {'lookup', 'explore', 'plan', 'debug', 'review'}
 SUPPORTED_ROLES = READ_ROLES | {'implement', 'complex'}
 SUPPORTED_PROVIDERS = {'codex', 'claude'}
 IMPLEMENTATION_UNCERTAINTIES = {'specified', 'local', 'architectural'}
 PRICE_FIELDS = ('input', 'output', 'cached_input', 'cache_write')
+ROLE_ORDER = ('lookup', 'explore', 'plan', 'debug', 'implement', 'complex', 'review')
+# Roles that pay for a stronger model on purpose; the rest should save money.
+DEFAULT_QUALITY_ROLES = ('plan', 'debug', 'complex', 'review')
 WORKER_POLICY = '''You are an assigned worker. Execute only the assigned scope and do not delegate.
 The adapter owns task and run status; do not claim, close, or finalize Yggdrasil tasks.
 Preserve unrelated changes. Return evidence, changed files, verification, and remaining work.
@@ -90,6 +94,11 @@ def _validate_config(cfg):
             _validate_price(model['price'], f'models[{alias!r}].price')
     for model_id, price in _object(cfg.get('prices', {}), 'prices').items():
         _validate_price(price, f'prices[{model_id!r}]')
+    if 'quality_roles' in cfg:
+        roles = cfg['quality_roles']
+        if not isinstance(roles, list) or not set(roles) <= SUPPORTED_ROLES:
+            raise ValueError('quality_roles must be a list of supported roles: '
+                             + ', '.join(sorted(SUPPORTED_ROLES)))
     if 'baseline' in cfg and cfg['baseline'] not in models:
         raise ValueError(f'baseline refers to unknown model alias {cfg["baseline"]!r}')
 
@@ -565,7 +574,8 @@ def collect_telemetry(provider, path):
 
 
 def _model_key(name):
-    return re.sub(r'\[[^\]]*\]$', '', name.strip().lower())
+    # Ignore context-window suffixes (`[1m]`) and snapshot dates (`-20251001`).
+    return re.sub(r'-\d{8}$', '', re.sub(r'\[[^\]]*\]$', '', name.strip().lower()))
 
 
 def model_matches(requested, observed):
@@ -954,19 +964,72 @@ def price_cost(parts, price):
     return sum(parts[key] * rates[key] for key in parts) / 1_000_000
 
 
-def _price_for(cfg, requested, observed=None):
-    """Price the model that answered when known, else the one requested."""
+def load_pricing(path=None):
+    """The dated list-price baseline shipped with the runner, or None if absent."""
+    path = Path(path or PRICING)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f'Pricing baseline is unreadable: {path}: {error}')
+    if not isinstance(data, dict) or not isinstance(data.get('as_of'), str):
+        raise ValueError(f'Pricing baseline needs an as_of date: {path}')
+    try:
+        dt.date.fromisoformat(data['as_of'])
+    except ValueError:
+        raise ValueError(f'Pricing baseline as_of must be YYYY-MM-DD: {path}')
+    for model_id, price in _object(data.get('models'), 'pricing models').items():
+        _validate_price(price, f'pricing models[{model_id!r}]')
+    stale = data.get('stale_after_days', 30)
+    if isinstance(stale, bool) or not isinstance(stale, int) or stale < 1:
+        raise ValueError('pricing stale_after_days must be a positive integer')
+    data['stale_after_days'] = stale
+    data['path'] = str(path)
+    return data
+
+
+def pricing_status(pricing, today=None):
+    if not pricing:
+        return None
+    age = ((today or dt.date.today()) - dt.date.fromisoformat(pricing['as_of'])).days
+    return {'as_of': pricing['as_of'], 'age_days': age,
+            'stale': age > pricing['stale_after_days'],
+            'stale_after_days': pricing['stale_after_days'], 'path': pricing['path'],
+            'sources': pricing.get('sources', [])}
+
+
+def price_lookup(cfg, requested, observed=None, pricing=None):
+    """Price the model that answered when known, else the one requested.
+
+    User configuration overrides the dated baseline: `prices`, then an alias's
+    `price`, then pricing.json. Returns (price, source) or (None, None).
+    """
     model = observed or requested
     if not model:
-        return None
+        return None, None
     for model_id, price in (cfg.get('prices') or {}).items():
         if _model_key(model_id) == _model_key(model):
-            return price
+            return price, 'config'
     for entry in cfg['models'].values():
         if entry.get('price') and (_model_key(entry['model']) == _model_key(model)
                                    or (not observed and model_matches(model, entry['model']))):
-            return entry['price']
-    return None
+            return entry['price'], 'config'
+    if pricing:
+        for model_id, price in pricing['models'].items():
+            if _model_key(model_id) == _model_key(model):
+                return price, 'pricing.json'
+        if not observed:
+            for entry in cfg['models'].values():
+                if model_matches(model, entry['model']):
+                    for model_id, price in pricing['models'].items():
+                        if _model_key(model_id) == _model_key(entry['model']):
+                            return price, 'pricing.json'
+    return None, None
+
+
+def _price_for(cfg, requested, observed=None, pricing=None):
+    return price_lookup(cfg, requested, observed, pricing)[0]
 
 
 def parse_since(value):
@@ -989,7 +1052,7 @@ def _add_parts(total, parts):
     return total
 
 
-def run_cost(cfg, meta, telemetry, provider):
+def run_cost(cfg, meta, telemetry, provider, pricing=None):
     """Token parts and price-table cost for one run.
 
     Claude reports per-model usage (including helper models), which is priced
@@ -1006,7 +1069,7 @@ def run_cost(cfg, meta, telemetry, provider):
         parts, cost, unpriced = {}, 0.0, []
         for model, model_parts in per_model:
             _add_parts(parts, model_parts)
-            price = _price_for(cfg, model, model)
+            price = _price_for(cfg, model, model, pricing)
             if price:
                 cost += price_cost(model_parts, price)
             else:
@@ -1015,7 +1078,7 @@ def run_cost(cfg, meta, telemetry, provider):
     parts = token_parts(usage, provider)
     if not parts:
         return None, None, []
-    price = _price_for(cfg, meta.get('model'), observed)
+    price = _price_for(cfg, meta.get('model'), observed, pricing)
     if not price:
         return parts, None, [observed or meta.get('model') or '?']
     return parts, price_cost(parts, price), []
@@ -1028,18 +1091,21 @@ def run_stats(repo=None, session=None, task=None, since=None, baseline=None):
     baseline = baseline or cfg.get('baseline') or cfg['roles']['complex']
     if baseline not in models:
         raise ValueError(f'Unknown baseline alias {baseline!r}')
+    pricing = load_pricing()
     baseline_model = models[baseline]['model']
-    baseline_price = _price_for(cfg, baseline_model, baseline_model)
+    baseline_price = _price_for(cfg, baseline_model, baseline_model, pricing)
     cutoff = parse_since(since)
     totals = {'runs': 0, 'states': {}, 'escalations': 0, 'retries': 0, 'mismatches': 0,
               'tokens': {key: 0 for key in PRICE_FIELDS[::-1]}, 'total_tokens': 0,
-              'usage_known_runs': 0, 'reported_cost_usd': 0.0, 'reported_cost_runs': 0}
-    by_model, routing = {}, {}
+              'usage_known_runs': 0, 'reported_cost_usd': 0.0, 'reported_cost_runs': 0,
+              'estimated_cost_usd': 0.0, 'priced_runs': 0}
+    by_model, routing, role_parts = {}, {}, {}
     comparison = {'baseline': baseline, 'baseline_model': models[baseline]['model'],
                   'baseline_priced': bool(baseline_price), 'runs': 0,
                   'routed_usd': 0.0, 'baseline_usd': 0.0, 'unpriced_models': set(),
-                  'no_usage_runs': 0}
-    for _, meta in _iter_runs(repo):
+                  'no_usage_runs': 0, 'pricing': pricing_status(pricing),
+                  'quality_roles': list(cfg.get('quality_roles', DEFAULT_QUALITY_ROLES))}
+    for path, meta in _iter_runs(repo):
         if session and (meta.get('session') or {}).get('id') != session:
             continue
         if task and meta.get('task') != task:
@@ -1057,7 +1123,8 @@ def run_stats(repo=None, session=None, task=None, since=None, baseline=None):
         dispatch = meta.get('dispatch') or {}
         mismatch = not model_matches(meta.get('model'), observed)
         parts, estimate, unpriced = run_cost(cfg, meta, telemetry,
-                                             meta.get('provider') or telemetry.get('provider'))
+                                             meta.get('provider') or telemetry.get('provider'),
+                                             pricing)
         bucket = by_model.setdefault((alias, model), {
             'alias': alias, 'model': model, 'runs': 0, 'states': {}, 'elapsed_seconds': 0.0,
             'timed_runs': 0, 'tokens': {key: 0 for key in PRICE_FIELDS[::-1]},
@@ -1081,8 +1148,30 @@ def run_stats(repo=None, session=None, task=None, since=None, baseline=None):
             totals['reported_cost_runs'] += 1
             bucket['reported_cost_usd'] += cost
         role = meta.get('role') or '?'
-        routing.setdefault(role, {})
-        routing[role][alias] = routing[role].get(alias, 0) + 1
+        route = routing.setdefault(role, {}).setdefault(alias, {
+            'runs': 0, 'succeeded': 0, 'failed': 0, 'escalations': 0,
+            'verified_passed': 0, 'verified_failed': 0, 'priced_runs': 0,
+            'estimated_cost_usd': 0.0, 'compared_runs': 0, 'compared_usd': 0.0,
+            'baseline_usd': 0.0})
+        route['runs'] += 1
+        route['succeeded'] += state == 'succeeded'
+        route['failed'] += state in ('failed', 'cancelled')
+        route['escalations'] += dispatch.get('escalation') is True
+        try:
+            verification = json.loads((path.parent / 'verification.json').read_text())
+        except (OSError, json.JSONDecodeError):
+            verification = None
+        if isinstance(verification, dict):
+            route['verified_passed'] += verification.get('status') == 'passed'
+            route['verified_failed'] += verification.get('status') == 'failed'
+        if parts and estimate is not None:
+            _add_parts(role_parts.setdefault(role, {}), parts)
+            route['priced_runs'] += 1
+            route['estimated_cost_usd'] += estimate
+            if baseline_price:
+                route['compared_runs'] += 1
+                route['compared_usd'] += estimate
+                route['baseline_usd'] += price_cost(parts, baseline_price)
         if parts:
             totals['usage_known_runs'] += 1
             bucket['usage_runs'] += 1
@@ -1094,11 +1183,18 @@ def run_stats(repo=None, session=None, task=None, since=None, baseline=None):
         else:
             bucket['priced_runs'] += 1
             bucket['estimated_cost_usd'] += estimate
+            totals['priced_runs'] += 1
+            totals['estimated_cost_usd'] += estimate
             if baseline_price:
                 comparison['runs'] += 1
                 comparison['routed_usd'] += estimate
                 comparison['baseline_usd'] += price_cost(parts, baseline_price)
     comparison['unpriced_models'] = sorted(comparison['unpriced_models'])
+    alias_prices = {alias: _price_for(cfg, entry['model'], entry['model'], pricing)
+                    for alias, entry in models.items()}
+    comparison['role_alternatives'] = {
+        role: {alias: price_cost(parts, price) for alias, price in alias_prices.items() if price}
+        for role, parts in role_parts.items()}
     return {'scope': {'repo': str(repo) if repo else None, 'session': session, 'task': task,
                       'since': cutoff.astimezone().isoformat() if cutoff else None},
             'totals': totals,
@@ -1129,6 +1225,245 @@ def _scope_label(scope, short=False):
     return ', '.join(parts) or 'lifetime, all projects'
 
 
+WEAK_ROUTE_MIN_RUNS = 5
+WEAK_ROUTE_RATE = 0.8
+CHEAPER_THRESHOLD = 0.10
+MISSING_USAGE_SHARE = 0.05
+
+
+def _plural(count, word):
+    return f'{count} {word}' + ('' if count == 1 else 's')
+
+
+def _percent(value):
+    return '<1%' if 0 < value < 0.005 else f'{value:.0%}'
+
+
+def route_rows(stats):
+    """One row per role → alias in workflow order, with flags and plain-word notes."""
+    order = {role: index for index, role in enumerate(ROLE_ORDER)}
+    rows = []
+    for role in sorted(stats['routing'], key=lambda r: (order.get(r, len(order)), r)):
+        aliases = sorted(stats['routing'][role].items(), key=lambda item: (-item[1]['runs'], item[0]))
+        for position, (alias, route) in enumerate(aliases):
+            rate = route['succeeded'] / route['runs'] if route['runs'] else 0.0
+            checked = route.get('verified_passed', 0) + route.get('verified_failed', 0)
+            pass_rate = route.get('verified_passed', 0) / checked if checked else None
+            weak = route['runs'] >= WEAK_ROUTE_MIN_RUNS and rate < WEAK_ROUTE_RATE
+            weak_checks = (checked >= WEAK_ROUTE_MIN_RUNS and pass_rate is not None
+                           and pass_rate < WEAK_ROUTE_RATE)
+            notes = []
+            if weak:
+                notes.append(('lowest success rate' if rate == min(
+                    r['succeeded'] / r['runs'] for a in stats['routing'].values() for r in a.values()
+                    if r['runs'] >= WEAK_ROUTE_MIN_RUNS) else 'below 80% success', 'low'))
+            if route['escalations']:
+                notes.append((f'{route["escalations"]} came via escalation',
+                              f'{route["escalations"]} escalated'))
+            if route['runs'] < WEAK_ROUTE_MIN_RUNS and rate < 1:
+                notes.append((f'only {_plural(route["runs"], "run")}', _plural(route['runs'], 'run')))
+            if weak_checks:
+                notes.insert(0, (f'{_percent(pass_rate)} pass verification', 'checks fail'))
+            per_success = (route['estimated_cost_usd'] / route['succeeded']
+                           if route.get('priced_runs') and route['succeeded'] else None)
+            rows.append({'role': role if position == 0 else '', 'full_role': role, 'alias': alias,
+                         'runs': route['runs'], 'succeeded': route['succeeded'], 'rate': rate,
+                         'escalations': route['escalations'], 'weak': weak, 'notes': notes,
+                         'verified': f'{route.get("verified_passed", 0)}/{checked}' if checked else '',
+                         'verified_passed': route.get('verified_passed', 0),
+                         'checked': checked, 'weak_checks': weak_checks,
+                         'per_success': per_success})
+    return rows
+
+
+def alias_rows(stats):
+    """Per-alias cost view: model-ID variants of one alias are combined."""
+    merged = {}
+    for bucket in stats['by_model']:
+        row = merged.setdefault(bucket['alias'], {
+            'alias': bucket['alias'], 'runs': 0, 'usage_runs': 0, 'priced_runs': 0,
+            'unpriced_runs': 0, 'total_tokens': 0, 'estimated_cost_usd': 0.0})
+        for key in ('runs', 'usage_runs', 'priced_runs', 'unpriced_runs', 'total_tokens'):
+            row[key] += bucket[key]
+        row['estimated_cost_usd'] += bucket['estimated_cost_usd']
+    total = sum(row['estimated_cost_usd'] for row in merged.values())
+    for row in merged.values():
+        row['share'] = row['estimated_cost_usd'] / total if total and row['priced_runs'] else None
+        row['per_run'] = row['estimated_cost_usd'] / row['priced_runs'] if row['priced_runs'] else None
+        row['missing_usage'] = row['runs'] - row['usage_runs']
+    return sorted(merged.values(), key=lambda r: (-(r['estimated_cost_usd'] if r['priced_runs'] else -1),
+                                                  -r['runs'], r['alias']))
+
+
+def cost_verdict(comparison):
+    """Plain-language result of pricing the same tokens on the baseline alone, or None."""
+    if not comparison['baseline_priced'] or not comparison['runs']:
+        return None
+    return _difference(comparison['routed_usd'], comparison['baseline_usd'], comparison['baseline'])
+
+
+def _difference(mine, alone, name):
+    """Compare a routed cost with the same tokens on one model, relative to the one-model cost."""
+    if mine > alone:
+        share = (mine - alone) / alone if alone else None
+        more = f' ({_percent(share)} more)' if share is not None else ' more'
+        return {'cheaper': 'baseline', 'share': share, 'amount': mine - alone,
+                'short': f'cost {_percent(share)} more' if share is not None else 'cost more',
+                'text': f'Your mix cost ${mine - alone:.2f}{more} than using only {name} would have.',
+                'check': f'Your mix cost {_percent(share) if share is not None else "more"}'
+                         f'{" more" if share is not None else ""} than using only {name}'}
+    share = (alone - mine) / alone if alone else 0.0
+    if share < 0.005:
+        return {'cheaper': 'same', 'share': 0.0, 'amount': 0.0, 'short': 'same cost',
+                'text': f'Your mix cost the same as using only {name} would have.',
+                'check': f'your mix cost the same as using only {name}'}
+    return {'cheaper': 'mix', 'share': share, 'amount': alone - mine,
+            'short': f'saved {_percent(share)}' if share else 'same',
+            'text': f'Your mix saved ${alone - mine:.2f} ({_percent(share)}) versus using only {name}.',
+            'check': f'your mix saved {_percent(share)} versus using only {name}'}
+
+
+def role_costs(stats):
+    """Per role: routed cost and the same tokens on the baseline, split by intent."""
+    comparison = stats['comparison']
+    quality = set(comparison.get('quality_roles') or DEFAULT_QUALITY_ROLES)
+    order = {role: index for index, role in enumerate(ROLE_ORDER)}
+    rows = []
+    for role in sorted(stats['routing'], key=lambda r: (order.get(r, len(order)), r)):
+        routes = stats['routing'][role].values()
+        compared = sum(route.get('compared_runs', 0) for route in routes)
+        if not compared:
+            continue
+        mine = sum(route.get('compared_usd', 0.0) for route in routes)
+        alone = sum(route.get('baseline_usd', 0.0) for route in routes)
+        rows.append({'role': role, 'quality': role in quality, 'runs': compared,
+                     'routed_usd': mine, 'baseline_usd': alone,
+                     'result': _difference(mine, alone, comparison['baseline'])})
+    return rows
+
+
+def stats_checks(stats):
+    """(flagged, text) lines: problems first as flagged lines, then one line of passes."""
+    totals, comparison = stats['totals'], stats['comparison']
+    flagged, passed = [], []
+    quality = set(comparison.get('quality_roles') or DEFAULT_QUALITY_ROLES)
+    if not comparison['baseline_priced']:
+        flagged.append(f'No price for {comparison["baseline"]}; cost comparisons are off')
+    saving = []
+    for row in role_costs(stats):
+        if row['quality']:
+            continue
+        result = row['result']
+        if result['cheaper'] == 'baseline':
+            text = (f'{row["role"]} uses cheaper models but {result["short"]} than '
+                    f'{comparison["baseline"]} would for the same tokens '
+                    f'(${row["routed_usd"]:.2f} vs ${row["baseline_usd"]:.2f})')
+            used = set(stats['routing'][row['role']])
+            peers = {alias for role, aliases in stats['routing'].items() if role not in quality
+                     for alias in aliases} - used
+            options = comparison.get('role_alternatives', {}).get(row['role'], {})
+            cheaper = sorted((cost, alias) for alias, cost in options.items()
+                             if alias in peers and cost < row['routed_usd'])
+            if cheaper:
+                text += '; ' + ', '.join(f'{alias} would cost ${cost:.2f}' for cost, alias in cheaper[:2])
+            flagged.append(text)
+        elif result['share'] > CHEAPER_THRESHOLD:
+            saving.append(f'{row["role"]} {result["short"]}')
+    if saving:
+        passed.append('cheaper models saving: ' + ', '.join(saving))
+    for row in route_rows(stats):
+        if row['weak_checks']:
+            flagged.append(f'{row["full_role"]} → {row["alias"]} passed verification '
+                           f'{row["verified_passed"]} of {row["checked"]} '
+                           f'({_percent(row["verified_passed"] / row["checked"])})')
+        if row['weak']:
+            text = (f'{row["full_role"]} → {row["alias"]} succeeded {row["succeeded"]} of '
+                    f'{row["runs"]} ({_percent(row["rate"])})')
+            others = [(alias, route['escalations']) for alias, route
+                      in stats['routing'][row['full_role']].items()
+                      if alias != row['alias'] and route['escalations']]
+            if others:
+                text += '; ' + ', '.join(f'{alias} took {_plural(count, "escalation")}'
+                                         for alias, count in others)
+            flagged.append(text)
+    missing = totals['runs'] - totals['usage_known_runs']
+    if missing and missing / totals['runs'] > MISSING_USAGE_SHARE:
+        worst = [row for row in alias_rows(stats) if row['missing_usage']]
+        worst.sort(key=lambda row: -row['missing_usage'])
+        named = ', '.join(f'{row["alias"]} {row["missing_usage"]}' for row in worst[:2])
+        rest = missing - sum(row['missing_usage'] for row in worst[:2])
+        flagged.append(f'{_plural(missing, "run")} recorded no usage ({named}'
+                       + (f', other {rest}' if rest else '') + '); totals undercount')
+    status = comparison.get('pricing')
+    if status and status['stale']:
+        flagged.append(f'Prices are {status["age_days"]} days old (as of {status["as_of"]}); '
+                       'refresh with `agent-run prices`')
+    elif status:
+        passed.append(f'prices current ({status["as_of"]})')
+    if comparison['unpriced_models']:
+        flagged.append('No price for ' + ', '.join(comparison['unpriced_models']))
+    elif totals['usage_known_runs']:
+        passed.append('every model priced')
+    if totals['mismatches']:
+        flagged.append(f'{_plural(totals["mismatches"], "run")} answered by a different model '
+                       'than requested')
+    else:
+        passed.append('0 model mismatches')
+    lines = [(True, text) for text in flagged]
+    if passed:
+        lines.append((False, ' · '.join(passed)))
+    return lines
+
+
+def _summary_lines(stats):
+    totals = stats['totals']
+    runs, ok = totals['runs'], totals['states'].get('succeeded', 0)
+    failed = totals['states'].get('failed', 0)
+    cancelled = totals['states'].get('cancelled', 0)
+    active = runs - ok - failed - cancelled
+    parts = [f'{runs} · {ok} ok ({_percent(ok / runs)})', f'{failed} failed']
+    if cancelled:
+        parts.append(f'{cancelled} cancelled')
+    if active:
+        parts.append(f'{active} active')
+    if totals['retries']:
+        parts.append(_plural(totals['retries'], 'retry').replace('retrys', 'retries'))
+    lines = [('Runs', ' · '.join(parts))]
+    cost = []
+    if totals['priced_runs']:
+        cost.append(f'${totals["estimated_cost_usd"]:.2f} estimated at list prices '
+                    f'({totals["priced_runs"]} of {runs} runs)')
+    if totals['reported_cost_runs']:
+        cost.append(f'${totals["reported_cost_usd"]:.2f} reported by the CLIs '
+                    f'({totals["reported_cost_runs"]} of {runs} runs)')
+    for index, text in enumerate(cost or ['no priced usage yet']):
+        lines.append(('Cost' if index == 0 else '', text))
+    tokens = totals['tokens']
+    pieces = [(tokens['cached_input'], 'cache read'), (tokens['input'], 'in'),
+              (tokens['cache_write'], 'cache write'), (tokens['output'], 'out')]
+    detail = ' · '.join(f'{_tokens(value)} {label}' for value, label in pieces if value)
+    lines.append(('Tokens', f'{_tokens(totals["total_tokens"])}' + (f': {detail}' if detail else '')))
+    return lines
+
+
+def _comparison_lines(comparison, verdict):
+    status = comparison.get('pricing')
+    source = f'list prices ({status["as_of"]})' if status else 'configured prices'
+    return [f'Same tokens from {_plural(comparison["runs"], "run")}, re-priced at '
+            f'{comparison["baseline"]} {source}.',
+            f'Ignores quality: {comparison["baseline"]} might not have done every job as well.']
+
+
+def pricing_note(comparison):
+    status = comparison.get('pricing')
+    if not status:
+        return 'prices: configured only (no pricing.json baseline)'
+    note = f'prices as of {status["as_of"]} ({status["age_days"]} days old)'
+    if status['stale']:
+        note += f'; stale after {status["stale_after_days"]} days, refresh with `agent-run prices`'
+    return note
+
+
 def brief_stats(stats):
     totals, comparison = stats['totals'], stats['comparison']
     ok = totals['states'].get('succeeded', 0)
@@ -1136,14 +1471,16 @@ def brief_stats(stats):
             f'{_tokens(totals["total_tokens"])} tokens')
     missing = totals['runs'] - totals['usage_known_runs']
     if missing:
-        line += f' ({missing} runs without usage)'
+        line += f' ({_plural(missing, "run")} without usage)'
+    if totals['priced_runs']:
+        line += f' · ${totals["estimated_cost_usd"]:.2f} est. at list prices'
     if totals['reported_cost_runs']:
         line += f' · ${totals["reported_cost_usd"]:.2f} reported'
-    if comparison['runs']:
-        change = (f'{comparison["routed_usd"] / comparison["baseline_usd"] - 1:+.0%}, '
-                  if comparison['baseline_usd'] else '')
-        line += (f' · routed ${comparison["routed_usd"]:.2f} vs all-{comparison["baseline"]} '
-                 f'${comparison["baseline_usd"]:.2f} ({change}{comparison["runs"]} priced runs)')
+    verdict = cost_verdict(comparison)
+    if verdict:
+        line += ' · ' + verdict['check'][0].lower() + verdict['check'][1:]
+    if (comparison.get('pricing') or {}).get('stale'):
+        line += ' · ' + pricing_note(comparison)
     return line
 
 
@@ -1155,12 +1492,12 @@ def _bar(fraction, size):
 
 
 def format_panel(stats, width=80, color=False):
-    """Boxed view in the style of the Codex /status panel."""
+    """Boxed view: summary, checks, routes, cost by model, one-model comparison."""
     width = max(60, min(width, 100))
-    bars = width >= 72
+    inner = width - 4
+    wide = width >= 72
     paint = (lambda text, code: f'\033[{code}m{text}\033[0m') if color else (lambda text, code: text)
     totals, comparison = stats['totals'], stats['comparison']
-    inner = width - 4
     rows = []
 
     def line(text='', styled=None):
@@ -1168,101 +1505,199 @@ def format_panel(stats, width=80, color=False):
             text, styled = text[:inner - 1] + '…', None
         rows.append('│ ' + (styled or text) + ' ' * (inner - len(text)) + ' │')
 
+    def wrapped(text, first='', rest=None, code=None):
+        rest = ' ' * len(first) if rest is None else rest
+        import textwrap
+        for index, chunk in enumerate(textwrap.wrap(text, inner - len(first)) or ['']):
+            prefix = first if index == 0 else rest
+            line(prefix + chunk, (paint(prefix, code) + chunk) if code and index == 0 else None)
+
     def rule(title):
         label = f'─ {title} '[:width - 3]
         rows.append('├' + paint(label, '1') + '─' * (width - 2 - len(label)) + '┤')
 
-    runs, ok = totals['runs'], totals['states'].get('succeeded', 0)
-    rows.append('╭' + '─' * (width - 2) + '╮')
-    title = f'>_ agent-run stats ({_scope_label(stats["scope"], short=True)})'[:inner]
-    line(title, paint(title, '1'))
-    line()
-    if not runs:
+    title = f'─ agent-run stats · {_scope_label(stats["scope"], short=True)} '[:width - 3]
+    rows.append('╭' + paint(title, '1') + '─' * (width - 2 - len(title)) + '╮')
+    if not totals['runs']:
         line('No runs in this scope.')
         rows.append('╰' + '─' * (width - 2) + '╯')
         return '\n'.join(rows)
-    failed = totals['states'].get('failed', 0) + totals['states'].get('cancelled', 0)
-    active = runs - ok - failed
-    line(f'Runs:       {runs} total · {ok} succeeded · {failed} failed'
-         + (f' · {active} active' if active else ''))
-    if bars:
-        rate = ok / runs
-        meter = _bar(rate, 20)
-        text = f'Success:    {meter} {rate:.0%}'
-        line(text, f'Success:    {paint(meter, "32" if rate >= 0.9 else "33" if rate >= 0.7 else "31")} {rate:.0%}')
-    tokens = totals['tokens']
-    usage = f'Tokens:     {_tokens(totals["total_tokens"])} (in {_tokens(tokens["input"])} · ' \
-            f'cache {_tokens(tokens["cached_input"])} · out {_tokens(tokens["output"])})'
-    line(usage[:inner])
-    missing = runs - totals['usage_known_runs']
-    if missing:
-        line(f'            {missing} runs reported no usage')
-    if totals['reported_cost_runs']:
-        line(f'Reported:   ${totals["reported_cost_usd"]:.2f} ({totals["reported_cost_runs"]} runs report cost)')
-    line(f'Routing:    {totals["escalations"]} escalations · {totals["retries"]} retries · '
-         f'{totals["mismatches"]} model mismatches')
 
-    rule('Models · share of tokens' if bars else 'Models')
-    scale = totals['total_tokens'] or 1
-    alias_width = max(len(bucket['alias']) for bucket in stats['by_model'])
-    for bucket in stats['by_model']:
-        share = bucket['total_tokens'] / scale
-        if bucket['priced_runs']:
-            cost = f'${bucket["estimated_cost_usd"]:.2f}'
+    label_width = 10
+    for label, text in _summary_lines(stats):
+        wrapped(text, label.ljust(label_width))
+
+    rule('Checks')
+    for flag, text in stats_checks(stats):
+        marker = '!  ' if flag else 'ok '
+        wrapped(text, marker, '   ', ('31' if flag else '32'))
+
+    rule('Routes · quality by role')
+    routes = route_rows(stats)
+    role_width = max([len('role')] + [len(row['full_role']) for row in routes])
+    alias_width = max([len('model')] + [len(row['alias']) for row in routes])
+    extra = wide and any(row['verified'] or row['per_success'] for row in routes)
+    head = f'   {"role".ljust(role_width)}  {"model".ljust(alias_width)}  succeeded  rate'
+    if extra:
+        head += '  verified  $/success'
+    line(head, paint(head, '2'))
+    for row in routes:
+        marker = '!  ' if row['weak'] or row['weak_checks'] else '   '
+        cells = (f'{marker}{row["role"].ljust(role_width)}  {row["alias"].ljust(alias_width)}  '
+                 f'{row["succeeded"]:>5}/{row["runs"]:<3} {_percent(row["rate"]):>5}')
+        if extra:
+            cost = f'${row["per_success"]:.2f}' if row['per_success'] is not None else '-'
+            cells += f'  {row["verified"] or "-":>8}  {cost:>9}'
+        room = inner - len(cells) - 3
+        note = ', '.join(long for long, _ in row['notes'])
+        if len(note) > room:
+            note = ', '.join(short for _, short in row['notes'])
+        overflow = None
+        if len(note) > room:
+            # Keep every word: move the note onto its own indented line.
+            overflow, note = ', '.join(long for long, _ in row['notes']), ''
+        text = (cells + '   ' + note).rstrip() if note else cells
+        styled = None
+        if marker.strip():
+            styled = paint(marker, '31') + text[len(marker):]
+        elif row['rate'] == 1:
+            styled = paint(text, '2')
+        line(text, styled)
+        if overflow:
+            wrapped(overflow, ' ' * (3 + role_width + 2) + '↳ ')
+
+    rule('Models · share of estimated cost')
+    models = alias_rows(stats)
+    name_width = max(len(row['alias']) for row in models)
+    for row in models:
+        name = row['alias'].ljust(name_width)
+        if not row['usage_runs']:
+            text = f'{name} no usage recorded'
+            tail = _plural(row['runs'], 'run')
+            line(text + tail.rjust(inner - len(text)))
+            continue
+        runs = _plural(row['runs'], 'run')
+        tokens = _tokens(row['total_tokens'])
+        if row['priced_runs']:
+            figures = (f'{_percent(row["share"]):>4}  {"$%.2f" % row["estimated_cost_usd"]:>8}  '
+                       f'{"$%.2f" % row["per_run"]:>6}/run  {runs:>8}  {tokens:>7}')
         else:
-            cost = 'no price' if bucket['unpriced_runs'] else '-'
-        amount = _tokens(bucket['total_tokens']) if bucket['usage_runs'] else '-'
-        head = bucket['alias'].ljust(alias_width)
-        tail = f'{share:>4.0%} {amount:>7} {bucket["runs"]:>4} runs {cost:>9}'
-        if bars:
-            size = max(8, inner - len(head) - len(tail) - 2)
-            meter = _bar(share, size)
-            line(f'{head} {meter} {tail}', f'{head} {paint(meter, "36")} {tail}')
+            figures = f'{"":>4}  {"no price":>8}  {"":>9}  {runs:>8}  {tokens:>7}'
+        if wide:
+            size = max(8, inner - name_width - len(figures) - 2)
+            meter = _bar(row['share'] or 0, size)
+            line(f'{name} {meter} {figures}', f'{name} {paint(meter, "36")} {figures}')
         else:
-            line(f'{head} {tail}'[:inner])
+            line(f'{name} {figures}')
 
-    rule('Routes')
-    role_width = max(len(role) for role in stats['routing'])
-    for role, aliases in sorted(stats['routing'].items()):
-        text = f'{role.ljust(role_width)}  ' + ' · '.join(
-            f'{alias} ×{count}' for alias, count in sorted(aliases.items(), key=lambda i: -i[1]))
-        line(text[:inner])
-
-    rule(f'Unrouted estimate · all on {comparison["baseline"]}')
-    if not comparison['baseline_priced']:
-        line(f'Add a price to models.{comparison["baseline"]} to enable this estimate.'[:inner])
-    elif comparison['runs']:
-        top = max(comparison['routed_usd'], comparison['baseline_usd']) or 1
-        for label, value in (('routed', comparison['routed_usd']),
-                             ('baseline', comparison['baseline_usd'])):
-            if bars:
-                meter = _bar(value / top, 30)
-                line(f'{label:<9} {meter} ${value:.2f}', f'{label:<9} {paint(meter, "36")} ${value:.2f}')
-            else:
-                line(f'{label:<9} ${value:.2f}')
-        difference = comparison['routed_usd'] - comparison['baseline_usd']
-        verb = 'extra' if difference > 0 else 'saved'
-        share = (f' ({abs(difference) / comparison["baseline_usd"]:.0%})'
-                 if comparison['baseline_usd'] else '')
-        text = f'{verb:<9} ${abs(difference):.2f}{share} across {comparison["runs"]} priced runs'
-        line(text, paint(text, '31' if difference > 0 else '32'))
+    name = comparison['baseline']
+    rule(f'Did cheaper models save money? · vs {name} for everything' if wide
+         else 'Did cheaper models save money?')
+    verdict = cost_verdict(comparison)
+    if not verdict:
+        wrapped(f'Add a price for {name} to compare.' if not comparison['baseline_priced']
+                else 'No runs have both token usage and a price yet.')
     else:
-        line('No runs have both token usage and a price yet.')
-    if comparison['unpriced_models']:
-        line(('unpriced: ' + ', '.join(comparison['unpriced_models']))[:inner])
-    line('Estimate: same token counts; quality not measured.')
+        roles = role_costs(stats)
+        role_width = max(len(row['role']) for row in roles)
+        head = f'   {"role".ljust(role_width)}  {"yours":>9}  {("on " + name):>12}  result'
+        shown_head = False
+        for group, title in ((False, 'Cost roles · cheaper models by design'),
+                             (True, 'Quality roles · stronger models by design')):
+            members = [row for row in roles if row['quality'] == group]
+            if not members:
+                continue
+            line(title, paint(title, '1'))
+            if not shown_head:
+                line(head, paint(head, '2'))
+                shown_head = True
+            for row in members:
+                result = row['result']
+                flag = not group and result['cheaper'] == 'baseline'
+                marker = '!  ' if flag else '   '
+                by_design = group and result['cheaper'] == 'baseline' and wide
+                note = result['short'] + (' · by design' if by_design else '')
+                text = (f'{marker}{row["role"].ljust(role_width)}  {"$%.2f" % row["routed_usd"]:>9}  '
+                        f'{"$%.2f" % row["baseline_usd"]:>12}  {note}')
+                if len(text) > inner and by_design:
+                    text = text[:-len(' · by design')]
+                line(text, (paint(marker, '31') + text[len(marker):]) if flag else None)
+        label_size = len('All runs')
+        total = (f'{"All runs".ljust(label_size)}  ${comparison["routed_usd"]:.2f} yours vs '
+                 f'${comparison["baseline_usd"]:.2f} on {name}')
+        line(total)
+        wrapped(verdict['text'], '→ ', '  ')
+        for text in _comparison_lines(comparison, verdict):
+            wrapped(text)
     rows.append('╰' + '─' * (width - 2) + '╯')
     return '\n'.join(rows)
 
 
+def price_report(cfg=None, pricing=None, today=None):
+    cfg = cfg or config()
+    pricing = pricing if pricing is not None else load_pricing()
+    aliases = []
+    for alias, entry in cfg['models'].items():
+        price, source = price_lookup(cfg, entry['model'], entry['model'], pricing)
+        aliases.append({'alias': alias, 'model': entry['model'], 'price': price, 'source': source})
+    return {'pricing': pricing_status(pricing, today), 'notes': (pricing or {}).get('notes', []),
+            'models': (pricing or {}).get('models', {}), 'aliases': aliases}
+
+
+def format_price_report(report):
+    status = report['pricing']
+    lines = []
+    if status:
+        state = 'STALE' if status['stale'] else 'current'
+        lines += [f'Pricing baseline: {status["path"]}',
+                  f'As of {status["as_of"]} ({status["age_days"]} days old, {state}; '
+                  f'stale after {status["stale_after_days"]} days). USD per 1M tokens.']
+    else:
+        lines.append('No pricing.json baseline; only prices in models.json apply.')
+    lines += ['', 'Configured aliases']
+    rows = [('alias', 'model', 'input', 'cached', 'cache write', 'output', 'source')]
+    for item in report['aliases']:
+        price = item['price'] or {}
+        rows.append((item['alias'], item['model'], *[
+            (f'{price[key]:g}' if key in price else ('=input' if price else '-'))
+            for key in ('input', 'cached_input', 'cache_write', 'output')],
+            item['source'] or 'UNPRICED'))
+    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+    lines += ['  ' + '  '.join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip() for row in rows]
+    unpriced = [item['alias'] for item in report['aliases'] if not item['price']]
+    if status:
+        lines += ['', 'Sources (fetch these to refresh):']
+        lines += [f'  {source.get("provider", "?")}: {source.get("url", "?")}'
+                  + (f' ({source["verify"]})' if source.get('verify') else '')
+                  for source in status['sources']]
+        lines += ['', 'Notes:'] + [f'  - {note}' for note in report['notes']]
+    if unpriced or (status and status['stale']):
+        lines += ['', 'Action: refresh pricing.json from the sources above'
+                  + (f'; unpriced aliases: {", ".join(unpriced)}' if unpriced else '') + '.']
+    return '\n'.join(lines)
+
+
 def format_stats(stats):
+    """Plain view for agents and pipes: same wording and checks as the panel."""
     totals, comparison = stats['totals'], stats['comparison']
-    states = ', '.join(f'{count} {state}' for state, count in sorted(totals['states'].items()))
-    lines = [f'agent-run stats · {_scope_label(stats["scope"])}',
-             f'{totals["runs"]} runs ({states or "none"}) · {totals["escalations"]} escalations · '
-             f'{totals["retries"]} retries · {totals["mismatches"]} model mismatches', '']
+    lines = [f'agent-run stats · {_scope_label(stats["scope"])}']
     if not totals['runs']:
         return lines[0] + '\nNo runs in this scope.'
+    lines += [f'{label or "":<7} {text}'.rstrip() for label, text in _summary_lines(stats)]
+    lines += ['', 'Checks']
+    lines += [('  ! ' if flag else '  ok ') + text for flag, text in stats_checks(stats)]
+    lines += ['', 'Routes (role → model: succeeded/runs, rate, verified, $ per success)']
+    for row in route_rows(stats):
+        text = (f'  {"!" if row["weak"] or row["weak_checks"] else " "} '
+                f'{row["full_role"]} → {row["alias"]}: {row["succeeded"]}/{row["runs"]} '
+                f'{_percent(row["rate"])}')
+        if row['verified']:
+            text += f', verified {row["verified"]}'
+        if row['per_success'] is not None:
+            text += f', ${row["per_success"]:.2f}/success'
+        if row['notes']:
+            text += ' (' + ', '.join(long for long, _ in row['notes']) + ')'
+        lines.append(text)
     header = ('alias', 'model', 'runs', 'ok', 'failed', 'avg time', 'input', 'cache read',
               'cache write', 'output', 'reported $', 'est. $')
     table = [header]
@@ -1284,37 +1719,34 @@ def format_stats(stats):
             f'{bucket["reported_cost_usd"]:.2f}' if bucket['reported_cost_usd'] else '-',
             estimate))
     widths = [max(len(str(row[i])) for row in table) for i in range(len(header))]
-    rendered = ['  '.join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip() for row in table]
-    rendered.insert(1, '  '.join('-' * w for w in widths))
-    lines += ['By model'] + rendered + ['', 'Routing (role → alias × runs)']
-    width = max(len(role) for role in stats['routing'])
-    for role, aliases in sorted(stats['routing'].items()):
-        lines.append(f'  {role.ljust(width)}  ' + ', '.join(
-            f'{alias} ×{count}' for alias, count in sorted(aliases.items(), key=lambda i: -i[1])))
-    lines += ['', f'Unrouted estimate: same tokens, all on {comparison["baseline"]} '
-                  f'({comparison["baseline_model"]}) at price-table rates']
-    if not comparison['baseline_priced']:
-        lines.append(f'  Add a price to models.{comparison["baseline"]} to enable this estimate.')
-    elif comparison['runs']:
-        saved = comparison['baseline_usd'] - comparison['routed_usd']
-        if not comparison['baseline_usd']:
-            verdict = f'  extra     ${-saved:.2f} (baseline is free)' if saved < 0 else '  saved     $0.00'
-        elif saved >= 0:
-            verdict = f'  saved     ${saved:.2f} ({saved / comparison["baseline_usd"]:.0%})'
-        else:
-            verdict = (f'  extra     ${-saved:.2f} ({-saved / comparison["baseline_usd"]:.0%} '
-                       f'more than all-{comparison["baseline"]})')
-        lines += [f'  routed    ${comparison["routed_usd"]:.2f}',
-                  f'  baseline  ${comparison["baseline_usd"]:.2f}',
-                  verdict + f' across {comparison["runs"]} priced runs']
+    rendered = ['  ' + '  '.join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip()
+                for row in table]
+    rendered.insert(1, '  ' + '  '.join('-' * w for w in widths))
+    lines += ['', 'By model (estimated cost at list prices)'] + rendered
+    name = comparison['baseline']
+    lines += ['', f'Did cheaper models save money? (same tokens on {name} for everything)']
+    verdict = cost_verdict(comparison)
+    if not verdict:
+        lines.append(f'  Add a price for {name} to compare.' if not comparison['baseline_priced']
+                     else '  No runs have both token usage and a price yet.')
     else:
-        lines.append('  No runs have both token usage and a price yet.')
+        for group, title in ((False, 'Cost roles'), (True, 'Quality roles')):
+            for row in role_costs(stats):
+                if row['quality'] != group:
+                    continue
+                flag = not group and row['result']['cheaper'] == 'baseline'
+                lines.append(f'  {"!" if flag else " "} {title.lower()[:-1]} {row["role"]}: '
+                             f'${row["routed_usd"]:.2f} yours vs ${row["baseline_usd"]:.2f} on {name}, '
+                             f'{row["result"]["short"]}'
+                             + (' (by design)' if group and row['result']['cheaper'] == 'baseline' else ''))
+        lines.append(f'  All runs: ${comparison["routed_usd"]:.2f} yours vs '
+                     f'${comparison["baseline_usd"]:.2f} on {name}. {verdict["text"]}')
+        lines += ['  ' + text for text in _comparison_lines(comparison, verdict)]
     if comparison['unpriced_models']:
         lines.append('  Not compared (no price): ' + ', '.join(comparison['unpriced_models']))
     if comparison['no_usage_runs']:
-        lines.append(f'  Not compared (no token usage): {comparison["no_usage_runs"]} runs')
-    lines.append('  Estimate only: another model would use different token counts, '
-                 'and quality is not measured.')
+        lines.append(f'  Not compared (no token usage): {_plural(comparison["no_usage_runs"], "run")}')
+    lines.append('  ' + pricing_note(comparison))
     return '\n'.join(lines)
 
 
@@ -1393,13 +1825,15 @@ def main():
     p.add_argument('--repo', help='Limit to one repository (default: all projects)')
     p.add_argument('--limit', type=int, default=20, help='Rows to show; 0 for all')
     p.add_argument('--json', action='store_true')
+    p = sub.add_parser('prices', help='Pricing baseline, its age and sources, and alias coverage')
+    p.add_argument('--json', action='store_true')
     p = sub.add_parser('stats', help='Routing, token and cost rollup (lifetime by default)')
     p.add_argument('--session', nargs='?', const='current',
                    help='Limit to this session (default ID: the current one)')
     p.add_argument('--repo', help='Limit to one repository')
     p.add_argument('--task', help='Limit to one task reference')
     p.add_argument('--since', help='Limit to recent runs: 24h, 7d, 2w, or an ISO date')
-    p.add_argument('--baseline', help='Alias to price the unrouted estimate against')
+    p.add_argument('--baseline', help='Quality model to compare costs against (default: config baseline)')
     p.add_argument('--brief', action='store_true',
                    help='One line per scope; with --session also shows lifetime')
     view = p.add_mutually_exclusive_group()
@@ -1408,6 +1842,10 @@ def main():
     view.add_argument('--plain', action='store_true', help='Plain tables')
     p.add_argument('--json', action='store_true')
     args = parser.parse_args()
+    if args.command == 'prices':
+        report = price_report()
+        print(json.dumps(report, indent=2) if args.json else format_price_report(report))
+        return
     if args.command == 'stats':
         session = args.session
         if session == 'current':
