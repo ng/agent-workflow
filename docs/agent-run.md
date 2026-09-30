@@ -75,7 +75,7 @@ previous sample behavior, add exactly:
   "architectural": "astra"
 },
 "review_routes": {
-  "codex": "opus-4.6",
+  "codex": "opus-5.5",
   "claude": "astra"
 }
 ```

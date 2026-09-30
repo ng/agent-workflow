@@ -3,9 +3,9 @@
     "astra": {"provider": "codex", "model": "gpt-6-astra", "effort": "high"},
     "sol": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "medium"},
     "luna": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium"},
-    "sonnet": {"provider": "claude", "model": "sonnet", "effort": "medium"},
-    "opus-4.6": {"provider": "claude", "model": "claude-opus-4-6[1m]", "effort": "high"},
-    "fable": {"provider": "claude", "model": "claude-fable-5", "effort": "high"}
+    "sonnet": {"provider": "claude", "model": "claude-sonnet-5-5[1m]", "effort": "medium"},
+    "opus-5.5": {"provider": "claude", "model": "claude-opus-5-5[1m]", "effort": "high"},
+    "fable": {"provider": "claude", "model": "claude-fable-5-1", "effort": "high"}
   },
   "roles": {
     "lookup": "luna",
@@ -13,8 +13,8 @@
     "implement": "sol",
     "plan": "astra",
     "debug": "astra",
-    "complex": "opus-4.6",
-    "review": "opus-4.6"
+    "complex": "opus-5.5",
+    "review": "opus-5.5"
   },
   "implementation_routes": {
     "specified": "luna",
@@ -22,13 +22,13 @@
     "architectural": "astra"
   },
   "review_routes": {
-    "codex": "opus-4.6",
+    "codex": "opus-5.5",
     "claude": "astra"
   },
   "escalation": {
     "lookup": "sol",
     "explore": "astra",
-    "implement": "opus-4.6",
+    "implement": "opus-5.5",
     "complex": "astra"
   },
   "worker_packet_bytes": 12288,

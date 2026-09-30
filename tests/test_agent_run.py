@@ -76,11 +76,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(w.select('implement')['model'], 'gpt-5.6-sol')
         self.assertEqual(w.select('implement', uncertainty='specified')['alias'], 'luna')
         self.assertEqual(w.select('implement', uncertainty='architectural')['alias'], 'astra')
-        self.assertEqual(w.select('implement', override='opus-4.6',
-                                  uncertainty='specified')['alias'], 'opus-4.6')
-        self.assertEqual(w.select('review', after='opus-4.6')['alias'], 'astra')
-        self.assertEqual(w.select('review', override='luna', after='opus-4.6')['alias'], 'luna')
-        self.assertEqual(w.select('implement', escalate=True)['alias'], 'opus-4.6')
+        self.assertEqual(w.select('implement', override='opus-5.5',
+                                  uncertainty='specified')['alias'], 'opus-5.5')
+        self.assertEqual(w.select('review', after='opus-5.5')['alias'], 'astra')
+        self.assertEqual(w.select('review', override='luna', after='opus-5.5')['alias'], 'luna')
+        self.assertEqual(w.select('implement', escalate=True)['alias'], 'opus-5.5')
         with self.assertRaises(ValueError):
             w.select('implement', override='not-a-model')
 
@@ -303,14 +303,14 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'events.jsonl'
             path.write_text(json.dumps({
-                'model': 'claude-opus-4-6', 'duration_ms': 2500,
+                'model': 'claude-opus-5-5', 'duration_ms': 2500,
                 'usage': {'input_tokens': 10, 'output_tokens': 4},
                 'total_cost_usd': 0.12,
                 'modelUsage': {
-                    'claude-opus-4-6': {'inputTokens': 10, 'outputTokens': 4, 'costUSD': 0.1},
+                    'claude-opus-5-5': {'inputTokens': 10, 'outputTokens': 4, 'costUSD': 0.1},
                     'claude-haiku-4-5': {'inputTokens': 2, 'outputTokens': 1, 'costUSD': 0.02}}}))
             telemetry = w.parse_claude_telemetry(path)
-            self.assertEqual(telemetry['observed_model'], 'claude-opus-4-6')
+            self.assertEqual(telemetry['observed_model'], 'claude-opus-5-5')
             self.assertEqual(telemetry['observed_models'][1]['kind'], 'helper')
             self.assertEqual(telemetry['usage']['total_tokens'], 14)
             self.assertEqual(telemetry['cost_usd'], 0.12)
